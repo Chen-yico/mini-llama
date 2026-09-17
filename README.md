@@ -192,8 +192,3 @@ GQA：`kv_head = q_head / (n_heads / n_kv_heads)`。Attention 点积后除以 `s
 3. `{% ... %}` Jinja2 子集：`for` / `if`、`loop.first`、`add_generation_prompt`、字符串拼接与 trim 标记
 
 多轮性能关键是最长公共前缀：`prefix_len = min(radix_hit, CommonPrefixLength(ctx.token_history, tokens))`。前缀命中时只 Prefill 后缀，KV Cache 从 `prefix_len` 继续写；不命中或 `/clear` 时重建 `MiniLlamaContext`。
-
-## 参考
-
-- 参考实现：`llama-cpp-test`
-- 架构说明：`项目相关需求整合/mini-llama-cpp/`
