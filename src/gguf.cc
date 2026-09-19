@@ -584,28 +584,35 @@ bool GgufReader::Load(const std::string& path) {
 // ---------------------------------------------------------------------------
 void InspectGguf(const GgufReader& reader) {
   std::cout << "=== GGUF Info ===\n"
-            << "  version:      " << reader.version << "\n"
-            << "  n_tensors:    " << reader.n_tensors << "\n"
-            << "  n_metadata:   " << reader.n_metadata << "\n"
-            << "  data_offset:  " << reader.data_offset << "\n";
+            << "  version:    " << reader.version << "\n"
+            << "  n_tensors:  " << reader.n_tensors << "\n"
+            << "  n_metadata: " << reader.n_metadata << "\n"
+            << "  data_offset: " << reader.data_offset << "\n";
 
-  for (const GgufMetadataKv& kv : reader.metadata) {
-    std::cout << "  " << kv.key << " (" << GgufValueTypeName(kv.type)
-              << "): " << kv.value_str << "\n";
+  if (!reader.metadata.empty()) {
+    std::cout << "\n=== Metadata ===\n";
+    for (const GgufMetadataKv& kv : reader.metadata) {
+      std::cout << "  " << kv.key << " (" << GgufValueTypeName(kv.type)
+                << "): " << kv.value_str << "\n";
+    }
   }
 
-  for (const GgufTensorInfo& tensor : reader.tensors) {
-    std::cout << "  " << tensor.name << "\n"
-              << "    shape:  [";
-    for (size_t i = 0; i < tensor.shape.size(); ++i) {
-      if (i > 0) {
-        std::cout << ", ";
+  if (!reader.tensors.empty()) {
+    std::cout << "\n=== Tensors ===\n";
+    for (const GgufTensorInfo& tensor : reader.tensors) {
+      std::cout << "  " << tensor.name << "\n"
+                << "    shape:  [";
+      for (size_t i = 0; i < tensor.shape.size(); ++i) {
+        if (i > 0) {
+          std::cout << ", ";
+        }
+        std::cout << tensor.shape[i];
       }
-      std::cout << tensor.shape[i];
+      std::cout << "]\n"
+                << "    dtype:  " << GgmlTypeName(tensor.type) << " ("
+                << tensor.type << ")\n"
+                << "    offset: " << tensor.offset << "\n";
     }
-    std::cout << "]\n"
-              << "    dtype:  " << GgmlTypeName(tensor.type) << "\n"
-              << "    offset: " << tensor.offset << "\n";
   }
 }
 

@@ -24,6 +24,7 @@
 #include "mini_llama/request_context.h"
 #include "mini_llama/sampler.h"
 #include "mini_llama/terminal.h"
+#include "mini_llama/thread_pool.h"
 #include "mini_llama/tokenizer.h"
 
 namespace {
@@ -34,12 +35,12 @@ void PrintUsage(const char* program) {
       << "  " << program << " --help\n"
       << "  " << program
       << " generate [--model path|dir] [--tokenizer vocab.json] [-p prompt] "
-         "[-n tokens] [--temperature T] [--top-k k] [--seed S]\n"
+         "[-n tokens] [--temperature T] [--top-k k] [--seed S] [--threads N]\n"
       << "  " << program << " inspect <model-path|dir>\n"
       << "  " << program << " inspect-gguf <path>\n"
       << "  " << program
       << " run [model-path|dir] [--tokenizer vocab.json] [-n tokens] "
-         "[--temperature T] [--top-k k] [--seed S]\n\n"
+         "[--temperature T] [--top-k k] [--seed S] [--synthetic]\n\n"
       << "Commands:\n"
       << "  generate     Tokenize, run CPU forward, and sample tokens.\n"
       << "  inspect      Print model.json metadata and load JSON+BIN weights.\n"
@@ -107,7 +108,8 @@ bool ParseUnsigned(const std::string& text, unsigned int& value) {
   }
 }
 
-std::string FindGgufInDirectory(const std::string& dir) {
+std::string FindGgufInDirectory(const std::string& dir,
+                                bool skip_inspect_fixture = false) {
   std::vector<std::filesystem::path> candidates;
   std::error_code error_code;
   for (const auto& entry :
@@ -118,6 +120,10 @@ std::string FindGgufInDirectory(const std::string& dir) {
     std::error_code file_error;
     if (entry.is_regular_file(file_error) && !file_error &&
         entry.path().extension() == ".gguf") {
+      if (skip_inspect_fixture &&
+          entry.path().filename() == "test.gguf") {
+        continue;
+      }
       candidates.push_back(entry.path());
     }
   }
@@ -230,9 +236,52 @@ mini_llama::MiniLlamaModel LoadWeightsFromPath(const std::string& path) {
   return mini_llama::LoadModel(json_path.string(), bin_path.string());
 }
 
+std::string ResolveModelPath(const std::string& path) {
+  if (!std::filesystem::is_directory(path)) {
+    return path;
+  }
+  const std::filesystem::path json_path =
+      std::filesystem::path(path) / "model.json";
+  const std::filesystem::path bin_path =
+      std::filesystem::path(path) / "model.bin";
+  if (std::filesystem::exists(json_path) &&
+      std::filesystem::exists(bin_path)) {
+    return path;
+  }
+  const std::string gguf_path = FindGgufInDirectory(path);
+  if (!gguf_path.empty()) {
+    return gguf_path;
+  }
+  return path;
+}
+
+void PrintCpuBanner() {
+  std::cout << "mini-llama\n==============\n\nbackend: cpu\ncompute: cpu\n";
+}
+
+void PrintIntList(const char* label, const std::vector<int>& values) {
+  std::cout << label << " [";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      std::cout << ", ";
+    }
+    std::cout << values[i];
+  }
+  std::cout << "]\n";
+}
+
+int FailRequest(mini_llama::RequestContext& request, const std::string& message) {
+  request.SetError(message);
+  request.Finish();
+  mini_llama::PrintRequestTrace(request, std::cerr);
+  std::cerr << request.error << "\n";
+  return 1;
+}
+
 int RunGenerate(int argc, char** argv) {
   std::string prompt = "hello";
   int n_predict = 8;
+  int n_threads = 0;
   mini_llama::SamplingParams sampling_params;
   std::string model_path = "models/tiny";
   std::string explicit_tokenizer_path;
@@ -281,6 +330,15 @@ int RunGenerate(int argc, char** argv) {
         std::cerr << "seed must be a non-negative integer\n";
         return 1;
       }
+    } else if (arg == "--threads") {
+      if (i + 1 >= argc) {
+        std::cerr << "missing value for " << arg << "\n";
+        return 1;
+      }
+      if (!ParseNonNegativeInt(argv[++i], n_threads)) {
+        std::cerr << "threads must be a non-negative integer\n";
+        return 1;
+      }
     } else if (arg == "--model") {
       if (i + 1 >= argc) {
         std::cerr << "missing value for " << arg << "\n";
@@ -293,40 +351,36 @@ int RunGenerate(int argc, char** argv) {
         return 1;
       }
       explicit_tokenizer_path = argv[++i];
+    } else if (arg == "-h" || arg == "--help") {
+      PrintUsage(argv[0]);
+      return 0;
     } else {
       std::cerr << "unknown option: " << arg << "\n";
       return 1;
     }
   }
 
-  std::unique_ptr<mini_llama::ITokenizer> tokenizer;
+  PrintCpuBanner();
+
+  const std::string resolved = ResolveModelPath(model_path);
+  mini_llama::RequestContext request =
+      mini_llama::StartRequest("generate", "cpu", resolved);
+
+  auto stage_start = mini_llama::RequestClock::now();
   mini_llama::MiniLlamaModel model = LoadWeightsFromPath(model_path);
+  request.model_load_ms = mini_llama::ElapsedMs(stage_start);
+  request.RecordEvent("model_load", request.model_load_ms, 0, resolved);
   if (!model.loaded) {
-    std::cerr << "Failed to load model: " << model.load_error << "\n";
-    return 1;
+    return FailRequest(request, "Failed to load model: " + model.load_error);
   }
+  request.RecordEvent("quantize", 0.0, 0, "model-native");
 
-  std::string resolved = model_path;
-  if (std::filesystem::is_directory(model_path)) {
-    const std::filesystem::path json_path =
-        std::filesystem::path(model_path) / "model.json";
-    const std::filesystem::path bin_path =
-        std::filesystem::path(model_path) / "model.bin";
-    if (!(std::filesystem::exists(json_path) &&
-          std::filesystem::exists(bin_path))) {
-      const std::string gguf_path = FindGgufInDirectory(model_path);
-      if (!gguf_path.empty()) {
-        resolved = gguf_path;
-      }
-    }
-  }
-
+  std::unique_ptr<mini_llama::ITokenizer> tokenizer;
   if (EndsWithGguf(resolved)) {
     tokenizer = LoadTokenizerForGguf(resolved, explicit_tokenizer_path);
+  } else if (!explicit_tokenizer_path.empty()) {
+    tokenizer = CreateTokenizerFromVocabHint(explicit_tokenizer_path);
   } else {
-    if (!explicit_tokenizer_path.empty()) {
-      tokenizer = CreateTokenizerFromVocabHint(explicit_tokenizer_path);
-    } else {
     std::filesystem::path json_path;
     if (std::filesystem::is_directory(model_path)) {
       json_path = std::filesystem::path(model_path) / "model.json";
@@ -340,125 +394,111 @@ int RunGenerate(int argc, char** argv) {
     try {
       manifest = mini_llama::ParseManifest(json_path.string());
     } catch (const std::exception& e) {
-      std::cerr << "Failed to parse model.json: " << e.what() << "\n";
-      return 1;
+      return FailRequest(request,
+                         "Failed to parse model.json: " + std::string(e.what()));
     }
     if (manifest.tokenizer.type == "json_vocab") {
       std::filesystem::path tokenizer_path = manifest.tokenizer.path;
       if (tokenizer_path.empty()) {
-        std::cerr << "json_vocab tokenizer requires a path\n";
-        return 1;
+        return FailRequest(request, "Failed to load tokenizer.");
       }
       if (tokenizer_path.is_relative()) {
         tokenizer_path = json_path.parent_path() / tokenizer_path;
       }
       if (!std::filesystem::exists(tokenizer_path)) {
-        std::cerr << "Tokenizer file not found: " << tokenizer_path.string()
-                  << "\n";
-        return 1;
+        return FailRequest(request, "Failed to load tokenizer.");
       }
       try {
         tokenizer = std::make_unique<mini_llama::JsonVocabTokenizer>(
             tokenizer_path.string());
-      } catch (const std::exception& e) {
-        std::cerr << "Failed to load json_vocab tokenizer: " << e.what()
-                  << "\n";
-        return 1;
+      } catch (const std::exception&) {
+        return FailRequest(request, "Failed to load tokenizer.");
       }
     } else {
       tokenizer = mini_llama::CreateTokenizer("");
     }
-    }
   }
 
   if (!tokenizer) {
-    std::cerr << "Failed to load tokenizer from " << model_path << "\n";
-    return 1;
+    return FailRequest(request, "Failed to load tokenizer.");
   }
   if (model.config.vocab_size < tokenizer->vocab_size()) {
-    std::cerr << "Model vocab_size must be at least "
-              << tokenizer->vocab_size() << " for the tokenizer.\n";
-    return 1;
+    return FailRequest(request, "Model vocab_size must be at least " +
+                                    std::to_string(tokenizer->vocab_size()) +
+                                    " for the tokenizer.");
   }
-  const mini_llama::ModelConfig& config = model.config;
 
-  mini_llama::RequestContext request =
-      mini_llama::StartRequest("generate", "cpu", "");
-
-  auto stage_start = mini_llama::RequestClock::now();
-  const std::vector<int> prompt_tokens = tokenizer->Encode(prompt);
+  stage_start = mini_llama::RequestClock::now();
+  const std::vector<int> tokens = tokenizer->Encode(prompt);
   request.tokenize_ms = mini_llama::ElapsedMs(stage_start);
-  const int token_count = static_cast<int>(prompt_tokens.size());
-  request.prompt_tokens = token_count;
-  request.RecordEvent("tokenize", request.tokenize_ms, token_count,
-                      "prompt tokenized");
+  request.prompt_tokens = static_cast<int>(tokens.size());
+  request.RecordEvent("tokenize", request.tokenize_ms, request.prompt_tokens,
+                      "prompt");
 
-  if (prompt_tokens.empty()) {
-    request.SetError("Prompt produced no tokens.");
-    request.Finish();
-    mini_llama::PrintRequestTrace(request, std::cerr);
-    std::cerr << request.error << "\n";
-    return 1;
+  std::cout << "prompt: " << prompt << "\n";
+  PrintIntList("tokens:", tokens);
+  mini_llama::SetThreadCount(n_threads);
+  std::cout << "sampling: temperature=" << sampling_params.temperature
+            << ", top_k=" << sampling_params.top_k
+            << ", seed=" << sampling_params.seed << "\n"
+            << "quant: model-native\n"
+            << "threads: " << mini_llama::GetThreadCount() << "\n\n";
+
+  if (tokens.empty()) {
+    return FailRequest(request, "Prompt produced no tokens.");
   }
-
-  if (static_cast<size_t>(token_count) + static_cast<size_t>(n_predict) >
-      static_cast<size_t>(config.max_seq_len)) {
-    request.SetError("Requested tokens exceed context window.");
-    request.Finish();
-    mini_llama::PrintRequestTrace(request, std::cerr);
-    std::cerr << request.error << "\n";
-    return 1;
+  if (tokens.size() + static_cast<size_t>(n_predict) >
+      static_cast<size_t>(model.config.max_seq_len)) {
+    return FailRequest(request, "Requested tokens exceed context window.");
   }
 
   mini_llama::MiniSampler sampler(sampling_params);
   mini_llama::MiniLlamaContext ctx(&model);
-  stage_start = mini_llama::RequestClock::now();
-  mini_llama::Tensor logits = mini_llama::ForwardBatch(
-      ctx, model, mini_llama::MiniBatch::FromTokens(prompt_tokens, 0));
-  request.prefill_ms = mini_llama::ElapsedMs(stage_start);
-  request.prefill_tokens = token_count;
-  ctx.n_prefill_tokens += token_count;
-  request.RecordEvent("prefill", request.prefill_ms, request.prefill_tokens,
-                      "batch");
-
   std::vector<int> generated;
-  generated.reserve(static_cast<size_t>(n_predict));
-  for (int i = 0; i < n_predict; ++i) {
+  try {
+    std::cout << "prefill...\n";
     stage_start = mini_llama::RequestClock::now();
-    const int next = sampler.Sample(logits, sampling_params);
-    request.sample_ms += mini_llama::ElapsedMs(stage_start);
-    generated.push_back(next);
-    if (next == tokenizer->eos_id() || i + 1 == n_predict) {
-      break;
-    }
+    mini_llama::Tensor logits = mini_llama::ForwardBatch(
+        ctx, model, mini_llama::MiniBatch::FromTokens(tokens, 0));
+    request.prefill_ms = mini_llama::ElapsedMs(stage_start);
+    request.prefill_tokens = static_cast<int>(tokens.size());
+    ctx.n_prefill_tokens += request.prefill_tokens;
+    request.RecordEvent("prefill", request.prefill_ms, request.prefill_tokens,
+                        "batch");
 
-    stage_start = mini_llama::RequestClock::now();
-    logits = mini_llama::ForwardBatch(
-        ctx, model, mini_llama::MiniBatch::Single(next, ctx.pos + 1));
-    const double decode_ms = mini_llama::ElapsedMs(stage_start);
-    request.decode_ms += decode_ms;
-    ++request.decode_tokens;
-    ++ctx.n_decode_tokens;
-    request.RecordEvent("decode", decode_ms, 1,
-                        "pos=" + std::to_string(ctx.pos));
+    std::cout << "decode loop...\n";
+    generated.reserve(static_cast<size_t>(n_predict));
+    for (int i = 0; i < n_predict; ++i) {
+      stage_start = mini_llama::RequestClock::now();
+      const int next = sampler.Sample(logits, sampling_params);
+      request.sample_ms += mini_llama::ElapsedMs(stage_start);
+      generated.push_back(next);
+      if (next == tokenizer->eos_id() || i + 1 == n_predict) {
+        break;
+      }
+
+      stage_start = mini_llama::RequestClock::now();
+      logits = mini_llama::ForwardBatch(
+          ctx, model, mini_llama::MiniBatch::Single(next, ctx.pos + 1));
+      const double decode_ms = mini_llama::ElapsedMs(stage_start);
+      request.decode_ms += decode_ms;
+      ++request.decode_tokens;
+      ++ctx.n_decode_tokens;
+      request.RecordEvent("decode", decode_ms, 1,
+                          "pos=" + std::to_string(ctx.pos));
+    }
+  } catch (const std::exception& e) {
+    return FailRequest(request, "Inference failed: " + std::string(e.what()));
   }
 
   request.generated_tokens = static_cast<int>(generated.size());
+  request.RecordEvent("sample", request.sample_ms, request.generated_tokens,
+                      "generated_tokens");
   request.Finish();
+  std::cout << "\n";
+  PrintIntList("generated tokens:", generated);
+  std::cout << "generated text: \"" << tokenizer->Decode(generated) << "\"\n";
   mini_llama::PrintRequestTrace(request, std::cout);
-
-  std::cout << "mini-llama generate\n"
-            << "prompt: " << prompt << "\n"
-            << "prompt_tokens: " << token_count << "\n"
-            << "n_predict: " << n_predict << "\n"
-            << "sampling: temperature=" << sampling_params.temperature
-            << ", top_k=" << sampling_params.top_k
-            << ", seed=" << sampling_params.seed << "\n"
-            << "completion: " << tokenizer->Decode(generated) << "\n"
-            << "status: CPU Forward on "
-            << (EndsWithGguf(resolved) ? "GGUF weights (dequantized to F32)"
-                                       : "JSON+BIN F32 weights")
-            << ".\n";
   return 0;
 }
 
@@ -555,6 +595,7 @@ int RunChat(int argc, char** argv) {
   std::string explicit_tokenizer_path;
   int max_response_tokens = 64;
   mini_llama::SamplingParams sampling_params;
+  bool use_synthetic = false;
   int argi = 2;
   if (argi < argc && argv[argi][0] != '-') {
     model_path = argv[argi++];
@@ -604,6 +645,8 @@ int RunChat(int argc, char** argv) {
         return 1;
       }
       explicit_tokenizer_path = argv[++i];
+    } else if (arg == "--synthetic") {
+      use_synthetic = true;
     } else if (arg == "-h" || arg == "--help") {
       PrintUsage(argv[0]);
       return 0;
@@ -622,10 +665,30 @@ int RunChat(int argc, char** argv) {
   std::unique_ptr<mini_llama::ITokenizer> tokenizer;
   std::string chat_template;
   std::string resolved_path = model_path;
-  if (std::filesystem::is_directory(model_path)) {
-    const std::string gguf_path = FindGgufInDirectory(model_path);
+  mini_llama::MiniLlamaModel model;
+  bool gguf_loaded = false;
+  if (use_synthetic) {
+    if (!std::filesystem::is_directory(model_path)) {
+      std::cerr << "--synthetic requires a model directory with vocab.json.\n";
+      return 1;
+    }
+    if (!std::filesystem::exists(std::filesystem::path(model_path) /
+                                 "vocab.json")) {
+      std::cerr << "No vocab.json in directory: " << model_path << "\n";
+      return 1;
+    }
+  } else if (std::filesystem::is_directory(model_path)) {
+    const std::string gguf_path =
+        FindGgufInDirectory(model_path, /*skip_inspect_fixture=*/true);
     if (!gguf_path.empty()) {
+      mini_llama::MiniLlamaModel loaded = mini_llama::LoadGgufModel(gguf_path);
+      if (!loaded.loaded) {
+        std::cerr << "Failed to load model: " << loaded.load_error << "\n";
+        return 1;
+      }
       resolved_path = gguf_path;
+      model = std::move(loaded);
+      gguf_loaded = true;
     } else if (!std::filesystem::exists(
                    std::filesystem::path(model_path) / "vocab.json")) {
       std::cerr << "No GGUF model or vocab.json in directory: " << model_path
@@ -660,8 +723,14 @@ int RunChat(int argc, char** argv) {
   };
 
   if (EndsWithGguf(resolved_path)) {
+    if (!gguf_loaded) {
+      model = mini_llama::LoadGgufModel(resolved_path);
+      if (!model.loaded) {
+        std::cerr << "Failed to load model: " << model.load_error << "\n";
+        return 1;
+      }
+    }
     tokenizer = LoadTokenizerForGguf(resolved_path, explicit_tokenizer_path);
-    // tokenizer.chat_template from GGUF metadata; "qwen2" if missing on Qwen2.
     chat_template = mini_llama::LoadChatTemplateFromGguf(resolved_path);
     const std::filesystem::path gguf_dir =
         std::filesystem::path(resolved_path).parent_path();
@@ -673,25 +742,19 @@ int RunChat(int argc, char** argv) {
     if (!explicit_tokenizer_path.empty()) {
       tokenizer = CreateTokenizerFromVocabHint(explicit_tokenizer_path);
     }
-  }
-
-  if (!tokenizer) {
-    std::cerr << "Failed to load tokenizer from " << model_path << "\n";
-    return 1;
-  }
-
-  mini_llama::MiniLlamaModel model;
-  if (EndsWithGguf(resolved_path)) {
-    model = mini_llama::LoadGgufModel(resolved_path);
-    if (!model.loaded) {
-      std::cerr << "Failed to load GGUF: " << model.load_error << "\n";
+    if (!tokenizer) {
+      std::cerr << "Failed to load tokenizer.\n";
       return 1;
     }
-  } else {
     mini_llama::ModelConfig synthetic;
     synthetic.vocab_size = tokenizer->vocab_size();
     synthetic.max_seq_len = 256;
     model = mini_llama::MakeCpuTestModel(synthetic);
+  }
+
+  if (!tokenizer) {
+    std::cerr << "Failed to load tokenizer.\n";
+    return 1;
   }
   if (model.config.vocab_size < tokenizer->vocab_size()) {
     std::cerr << "Model vocab_size must be at least "
@@ -712,6 +775,8 @@ int RunChat(int argc, char** argv) {
   }
 
   term.PrintMessage("mini-llama chat");
+  term.PrintMessage("backend: cpu");
+  term.PrintMessage("compute: cpu");
   term.PrintMessage("Type /help for commands, /exit to quit.\n");
   if (EndsWithGguf(resolved_path)) {
     term.PrintMessage("CPU Forward on GGUF weights (dequantized to F32).\n");

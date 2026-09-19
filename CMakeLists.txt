@@ -67,3 +67,16 @@ set_target_properties(mini-llama-tests PROPERTIES OUTPUT_NAME mini-llama-tests)
 enable_testing()
 add_test(NAME mini-llama-tests COMMAND mini-llama-tests
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(
+    NAME cli-smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+            MINI_LLAMA_BIN=$<TARGET_FILE:mini-llama>
+            MINI_LLAMA_SKIP_REAL_MODEL=1
+            ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/scripts/test_real_model_smoke.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  )
+endif()
