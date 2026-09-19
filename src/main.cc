@@ -40,7 +40,7 @@ void PrintUsage(const char* program) {
       << "  " << program << " inspect-gguf <path>\n"
       << "  " << program
       << " run [model-path|dir] [--tokenizer vocab.json] [-n tokens] "
-         "[--temperature T] [--top-k k] [--seed S]\n\n"
+         "[--temperature T] [--top-k k] [--seed S] [--synthetic]\n\n"
       << "Commands:\n"
       << "  generate     Tokenize, run CPU forward, and sample tokens.\n"
       << "  inspect      Print model.json metadata and load JSON+BIN weights.\n"
@@ -108,7 +108,8 @@ bool ParseUnsigned(const std::string& text, unsigned int& value) {
   }
 }
 
-std::string FindGgufInDirectory(const std::string& dir) {
+std::string FindGgufInDirectory(const std::string& dir,
+                                bool skip_inspect_fixture = false) {
   std::vector<std::filesystem::path> candidates;
   std::error_code error_code;
   for (const auto& entry :
@@ -119,6 +120,10 @@ std::string FindGgufInDirectory(const std::string& dir) {
     std::error_code file_error;
     if (entry.is_regular_file(file_error) && !file_error &&
         entry.path().extension() == ".gguf") {
+      if (skip_inspect_fixture &&
+          entry.path().filename() == "test.gguf") {
+        continue;
+      }
       candidates.push_back(entry.path());
     }
   }
@@ -590,6 +595,7 @@ int RunChat(int argc, char** argv) {
   std::string explicit_tokenizer_path;
   int max_response_tokens = 64;
   mini_llama::SamplingParams sampling_params;
+  bool use_synthetic = false;
   int argi = 2;
   if (argi < argc && argv[argi][0] != '-') {
     model_path = argv[argi++];
@@ -639,6 +645,8 @@ int RunChat(int argc, char** argv) {
         return 1;
       }
       explicit_tokenizer_path = argv[++i];
+    } else if (arg == "--synthetic") {
+      use_synthetic = true;
     } else if (arg == "-h" || arg == "--help") {
       PrintUsage(argv[0]);
       return 0;
@@ -659,19 +667,28 @@ int RunChat(int argc, char** argv) {
   std::string resolved_path = model_path;
   mini_llama::MiniLlamaModel model;
   bool gguf_loaded = false;
-  if (std::filesystem::is_directory(model_path)) {
-    const std::string gguf_path = FindGgufInDirectory(model_path);
+  if (use_synthetic) {
+    if (!std::filesystem::is_directory(model_path)) {
+      std::cerr << "--synthetic requires a model directory with vocab.json.\n";
+      return 1;
+    }
+    if (!std::filesystem::exists(std::filesystem::path(model_path) /
+                                 "vocab.json")) {
+      std::cerr << "No vocab.json in directory: " << model_path << "\n";
+      return 1;
+    }
+  } else if (std::filesystem::is_directory(model_path)) {
+    const std::string gguf_path =
+        FindGgufInDirectory(model_path, /*skip_inspect_fixture=*/true);
     if (!gguf_path.empty()) {
       mini_llama::MiniLlamaModel loaded = mini_llama::LoadGgufModel(gguf_path);
-      if (loaded.loaded) {
-        resolved_path = gguf_path;
-        model = std::move(loaded);
-        gguf_loaded = true;
-      } else if (!std::filesystem::exists(
-                     std::filesystem::path(model_path) / "vocab.json")) {
+      if (!loaded.loaded) {
         std::cerr << "Failed to load model: " << loaded.load_error << "\n";
         return 1;
       }
+      resolved_path = gguf_path;
+      model = std::move(loaded);
+      gguf_loaded = true;
     } else if (!std::filesystem::exists(
                    std::filesystem::path(model_path) / "vocab.json")) {
       std::cerr << "No GGUF model or vocab.json in directory: " << model_path

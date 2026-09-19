@@ -92,7 +92,7 @@ models/chat/
 
 内置命令：`/help` `/clear` `/stats` `/params` `/exit`。`/clear` 会重建 `MiniLlamaContext`，避免 KV Cache 的 `pos` 与文本长度错位。
 
-`run models/chat` 会自动解析目录里的 GGUF；没有 GGUF 时，`run models/tiny` 仍用合成权重打通多轮对话。
+`run models/chat` 会自动解析目录里的可推理 GGUF；加载失败会直接报错退出，即使同目录有 `vocab.json` 也不会改用合成权重。教学对话用 `run models/tiny` 或显式 `run models/tiny --synthetic`。目录里的 inspect 夹具 `test.gguf` 不会被当成聊天模型。
 
 ## 真实模型端到端 Smoke Test
 
