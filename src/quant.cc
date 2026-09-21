@@ -4,6 +4,8 @@
 #include "mini_llama/quant.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -14,6 +16,45 @@
 
 namespace mini_llama {
 namespace {
+
+uint16_t FloatToFp16(float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+
+  uint32_t sign = (bits >> 16) & 0x8000u;
+  int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xffu) - 127 + 15;
+  uint32_t mantissa = bits & 0x7fffffu;
+
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return static_cast<uint16_t>(sign);
+    }
+    mantissa |= 0x800000u;
+    uint32_t shifted = mantissa >> (1 - exponent);
+    if ((shifted & 0x00001000u) != 0) {
+      shifted += 0x00002000u;
+    }
+    return static_cast<uint16_t>(sign | (shifted >> 13));
+  }
+
+  if (exponent >= 31) {
+    return static_cast<uint16_t>(sign | 0x7c00u);
+  }
+
+  if ((mantissa & 0x00001000u) != 0) {
+    mantissa += 0x00002000u;
+    if ((mantissa & 0x00800000u) != 0) {
+      mantissa = 0;
+      ++exponent;
+      if (exponent >= 31) {
+        return static_cast<uint16_t>(sign | 0x7c00u);
+      }
+    }
+  }
+
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) |
+                               (mantissa >> 13));
+}
 
 float Fp16ToFloat(uint16_t value) {
   uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16;
@@ -67,6 +108,67 @@ size_t CheckedNumel(const std::vector<int>& shape, const char* caller) {
 
 }  // namespace
 
+std::vector<BlockQ80> QuantizeToQ80(const Tensor& src) {
+  if (src.size() == 0) {
+    return {};
+  }
+
+  int row_size =
+      src.num_dims() >= 2 ? src.shape.back() : static_cast<int>(src.size());
+  int n_rows =
+      src.num_dims() >= 2 ? static_cast<int>(src.size()) / row_size : 1;
+  int row_blocks = (row_size + kQ80BlockSize - 1) / kQ80BlockSize;
+  size_t total_blocks = static_cast<size_t>(n_rows) * row_blocks;
+
+  std::vector<BlockQ80> blocks;
+  blocks.reserve(total_blocks);
+
+  for (int row = 0; row < n_rows; ++row) {
+    int row_offset = row * row_size;
+    for (int rb = 0; rb < row_blocks; ++rb) {
+      int base = row_offset + rb * kQ80BlockSize;
+      int k_end = std::min(base + kQ80BlockSize, row_offset + row_size);
+      int block_len = k_end - base;
+
+      float max_abs = 0.0f;
+      for (int k = base; k < k_end; ++k) {
+        float abs_val = std::abs(src.data[k]);
+        if (abs_val > max_abs) {
+          max_abs = abs_val;
+        }
+      }
+
+      BlockQ80 block;
+      std::memset(&block, 0, sizeof(block));
+      if (max_abs > 0.0f) {
+        float d = max_abs / 127.0f;
+        block.d = FloatToFp16(d);
+        float stored_d = Fp16ToFloat(block.d);
+        float id = stored_d == 0.0f ? 0.0f : 1.0f / stored_d;
+        for (int i = 0; i < block_len; ++i) {
+          float q = src.data[base + i] * id;
+          int qi = static_cast<int>(std::round(q));
+          if (qi > 127) {
+            qi = 127;
+          } else if (qi < -127) {
+            qi = -127;
+          }
+          block.qs[i] = static_cast<int8_t>(qi);
+        }
+      } else {
+        block.d = 0;
+      }
+      for (int i = block_len; i < kQ80BlockSize; ++i) {
+        block.qs[i] = 0;
+      }
+
+      blocks.push_back(block);
+    }
+  }
+
+  return blocks;
+}
+
 Tensor DequantizeFromQ80(const std::vector<BlockQ80>& blocks,
                          const std::vector<int>& shape) {
   size_t total = CheckedNumel(shape, "DequantizeFromQ80");
@@ -97,6 +199,81 @@ Tensor DequantizeFromQ80(const std::vector<BlockQ80>& blocks,
     }
   }
   return dst;
+}
+
+std::vector<BlockQ40> QuantizeToQ40(const Tensor& src) {
+  if (src.size() == 0) {
+    return {};
+  }
+
+  int row_size =
+      src.num_dims() >= 2 ? src.shape.back() : static_cast<int>(src.size());
+  int n_rows =
+      src.num_dims() >= 2 ? static_cast<int>(src.size()) / row_size : 1;
+  int row_blocks = (row_size + kQ40BlockSize - 1) / kQ40BlockSize;
+  size_t total_blocks = static_cast<size_t>(n_rows) * row_blocks;
+
+  std::vector<BlockQ40> blocks;
+  blocks.reserve(total_blocks);
+
+  for (int row = 0; row < n_rows; ++row) {
+    int row_offset = row * row_size;
+    for (int rb = 0; rb < row_blocks; ++rb) {
+      int base = row_offset + rb * kQ40BlockSize;
+      int k_end = std::min(base + kQ40BlockSize, row_offset + row_size);
+
+      float max_abs = 0.0f;
+      for (int k = base; k < k_end; ++k) {
+        float abs_val = std::abs(src.data[k]);
+        if (abs_val > max_abs) {
+          max_abs = abs_val;
+        }
+      }
+
+      BlockQ40 block;
+      std::memset(&block, 0, sizeof(block));
+      if (max_abs > 0.0f) {
+        float d = max_abs / 7.0f;
+        block.d = FloatToFp16(d);
+        float stored_d = Fp16ToFloat(block.d);
+        float id = stored_d == 0.0f ? 0.0f : 1.0f / stored_d;
+
+        for (int j = 0; j < kQ40BlockSize / 2; ++j) {
+          float x0 = 0.0f;
+          float x1 = 0.0f;
+          int idx0 = base + j;
+          int idx1 = base + j + kQ40BlockSize / 2;
+          if (idx0 < k_end) {
+            x0 = src.data[idx0] * id;
+          }
+          if (idx1 < k_end) {
+            x1 = src.data[idx1] * id;
+          }
+          int qi0 = static_cast<int>(std::round(x0 + 8.0f));
+          int qi1 = static_cast<int>(std::round(x1 + 8.0f));
+          if (qi0 < 0) {
+            qi0 = 0;
+          }
+          if (qi0 > 15) {
+            qi0 = 15;
+          }
+          if (qi1 < 0) {
+            qi1 = 0;
+          }
+          if (qi1 > 15) {
+            qi1 = 15;
+          }
+          block.qs[j] = static_cast<uint8_t>(qi0 | (qi1 << 4));
+        }
+      } else {
+        block.d = 0;
+      }
+
+      blocks.push_back(block);
+    }
+  }
+
+  return blocks;
 }
 
 Tensor DequantizeFromQ40(const std::vector<BlockQ40>& blocks,

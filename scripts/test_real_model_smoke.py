@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI smoke for inspect-gguf / generate / run.
+"""CLI smoke for inspect-gguf / generate / run / bench.
 
 Tiny JSON+BIN path always runs. Real Qwen2 GGUF is optional: skipped unless the
 file exists and MINI_LLAMA_SKIP_REAL_MODEL is unset.
@@ -116,6 +116,91 @@ def test_run_tiny_exit(binary):
     require("Goodbye." in out, out, "/exit")
 
 
+def test_bench_tiny(binary):
+    result = run_cmd(
+        [
+            binary,
+            "bench",
+            "models/tiny",
+            "-p",
+            "hello",
+            "-n",
+            "4",
+            "--seed",
+            "42",
+        ]
+    )
+    out = result.stdout
+    require("Benchmark: models/tiny" in out, out, "Benchmark header")
+    require("backend: cpu" in out, out, "backend: cpu")
+    require("compute: cpu" in out, out, "compute: cpu")
+    require("Results:" in out, out, "Results")
+    require("generated tokens:  4" in out, out, "generated tokens: 4")
+    require("Decode tokens:     3" in out, out, "Decode tokens: 3")
+    require("prefill time:" in out, out, "prefill time")
+    require("Decode time:" in out, out, "Decode time")
+    require("tokens/s (total):" in out, out, "tokens/s (total)")
+    require("tokens/s (Decode):" in out, out, "tokens/s (Decode)")
+    require("weight memory:" in out, out, "weight memory")
+
+    verbose = run_cmd(
+        [
+            binary,
+            "bench",
+            "models/tiny",
+            "-p",
+            "hello",
+            "-n",
+            "4",
+            "--seed",
+            "42",
+            "--verbose",
+        ]
+    )
+    vout = verbose.stdout
+    require("logits top-5:" in vout, vout, "logits top-5")
+    require("KV cache:" in vout, vout, "KV cache")
+    require("[verbose] Decode step" in vout, vout, "Decode step")
+
+    quant = run_cmd(
+        [
+            binary,
+            "bench",
+            "models/tiny",
+            "-p",
+            "hello",
+            "-n",
+            "4",
+            "--seed",
+            "42",
+            "--quant",
+            "q8_0",
+        ]
+    )
+    qout = quant.stdout
+    require("quant: q8_0" in qout, qout, "quant: q8_0")
+    require("weight memory:" in qout, qout, "quant weight memory")
+    require("logits error vs model-native:" in qout, qout, "logits error")
+
+    threaded = run_cmd(
+        [
+            binary,
+            "bench",
+            "models/tiny",
+            "-p",
+            "hello",
+            "-n",
+            "4",
+            "--seed",
+            "42",
+            "--threads",
+            "4",
+        ]
+    )
+    tout = threaded.stdout
+    require("threads: 4" in tout, tout, "threads: 4")
+
+
 def test_inspect_gguf_real(binary):
     result = run_cmd([binary, "inspect-gguf", str(REAL_GGUF)])
     out = result.stdout
@@ -177,6 +262,7 @@ def main():
         test_inspect_gguf_tiny,
         test_generate_tiny,
         test_run_tiny_exit,
+        test_bench_tiny,
     ]
     for test in tests:
         test(binary)
