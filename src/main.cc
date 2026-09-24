@@ -4,16 +4,20 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mini_llama/batch.h"
 #include "mini_llama/chat.h"
 #include "mini_llama/context.h"
+#include "mini_llama/debug.h"
 #include "mini_llama/forward.h"
 #include "mini_llama/gguf.h"
 #include "mini_llama/gguf_loader.h"
@@ -40,12 +44,17 @@ void PrintUsage(const char* program) {
       << "  " << program << " inspect-gguf <path>\n"
       << "  " << program
       << " run [model-path|dir] [--tokenizer vocab.json] [-n tokens] "
-         "[--temperature T] [--top-k k] [--seed S] [--synthetic]\n\n"
+         "[--temperature T] [--top-k k] [--seed S] [--synthetic]\n"
+      << "  " << program
+      << " bench <model-path|dir> [-p prompt] [-n tokens] [--seed S] "
+         "[--tokenizer vocab.json] [--quant q8_0|q4_0] [--threads N] "
+         "[--verbose]\n\n"
       << "Commands:\n"
       << "  generate     Tokenize, run CPU forward, and sample tokens.\n"
       << "  inspect      Print model.json metadata and load JSON+BIN weights.\n"
       << "  inspect-gguf Print GGUF header, metadata, and tensor index.\n"
-      << "  run          Interactive multi-turn chat.\n";
+      << "  run          Interactive multi-turn chat.\n"
+      << "  bench        Measure prefill / decode timing and weight memory.\n";
 }
 
 bool ParsePositiveInt(const std::string& text, int& value) {
@@ -253,6 +262,92 @@ std::string ResolveModelPath(const std::string& path) {
     return gguf_path;
   }
   return path;
+}
+
+std::unique_ptr<mini_llama::ITokenizer> LoadTokenizerForResolved(
+    const std::string& model_path, const std::string& resolved,
+    const std::string& explicit_tokenizer_path) {
+  if (EndsWithGguf(resolved)) {
+    return LoadTokenizerForGguf(resolved, explicit_tokenizer_path);
+  }
+  if (!explicit_tokenizer_path.empty()) {
+    return CreateTokenizerFromVocabHint(explicit_tokenizer_path);
+  }
+
+  std::filesystem::path json_path;
+  if (std::filesystem::is_directory(model_path)) {
+    json_path = std::filesystem::path(model_path) / "model.json";
+  } else {
+    const std::filesystem::path file(model_path);
+    json_path = file.extension() == ".json"
+                    ? file
+                    : file.parent_path() / "model.json";
+  }
+  if (!std::filesystem::exists(json_path)) {
+    return mini_llama::CreateTokenizer("");
+  }
+
+  try {
+    mini_llama::ModelManifest manifest =
+        mini_llama::ParseManifest(json_path.string());
+    if (manifest.tokenizer.type == "json_vocab") {
+      std::filesystem::path tokenizer_path = manifest.tokenizer.path;
+      if (tokenizer_path.empty()) {
+        return nullptr;
+      }
+      if (tokenizer_path.is_relative()) {
+        tokenizer_path = json_path.parent_path() / tokenizer_path;
+      }
+      if (!std::filesystem::exists(tokenizer_path)) {
+        return nullptr;
+      }
+      return std::make_unique<mini_llama::JsonVocabTokenizer>(
+          tokenizer_path.string());
+    }
+  } catch (const std::exception&) {
+    return nullptr;
+  }
+  return mini_llama::CreateTokenizer("");
+}
+
+void ApplyQuantOverride(mini_llama::MiniLlamaModel& model,
+                        const std::string& quant_type) {
+  if (quant_type.empty()) {
+    return;
+  }
+  if (quant_type == "q8_0") {
+    mini_llama::QuantizeModelToQ80(model);
+    return;
+  }
+  if (quant_type == "q4_0") {
+    mini_llama::QuantizeModelToQ40(model);
+    return;
+  }
+  throw std::runtime_error("unsupported quant type: " + quant_type);
+}
+
+mini_llama::Tensor RunLogitsForTokens(const mini_llama::MiniLlamaModel& model,
+                                      const std::vector<int>& tokens) {
+  mini_llama::MiniLlamaContext ctx(&model);
+  mini_llama::MiniBatch batch = mini_llama::MiniBatch::FromTokens(tokens, 0);
+  return mini_llama::ForwardBatch(ctx, model, batch);
+}
+
+std::pair<float, float> LogitsError(const mini_llama::Tensor& baseline,
+                                    const mini_llama::Tensor& candidate) {
+  if (baseline.shape != candidate.shape) {
+    throw std::runtime_error(
+        "LogitsError: shape mismatch, baseline=" + baseline.ShapeStringShort() +
+        ", candidate=" + candidate.ShapeStringShort());
+  }
+  float max_err = 0.0f;
+  float sum_err = 0.0f;
+  for (size_t i = 0; i < baseline.size(); ++i) {
+    float err = std::abs(baseline.data[i] - candidate.data[i]);
+    max_err = std::max(max_err, err);
+    sum_err += err;
+  }
+  return {max_err, sum_err / static_cast<float>(baseline.size())};
 }
 
 void PrintCpuBanner() {
@@ -578,6 +673,196 @@ int RunInspectGguf(int argc, char** argv) {
     return 1;
   }
   mini_llama::InspectGguf(reader);
+  return 0;
+}
+
+void PrintBenchUsage(const char* prog) {
+  std::cout
+      << "Usage: " << prog << " bench <model-path|dir> [options]\n"
+      << "Options:\n"
+      << "  -p, --prompt <str>    Input prompt text (default: \"hello\")\n"
+      << "  -n, --n-predict <n>   Number of tokens to generate (default: 64)\n"
+      << "  --seed <S>            Random seed (default: 0)\n"
+      << "  --tokenizer <path>    Path to vocab.json tokenizer file\n"
+      << "  --quant q8_0|q4_0     Quantize loaded Linear weights before "
+         "benchmark\n"
+      << "  --threads <n>         Number of threads for parallel ops (0 = "
+         "auto)\n"
+      << "  --verbose             Print debug dumps after each step\n"
+      << "  -h, --help            Show this help\n";
+}
+
+int RunBench(int argc, char** argv) {
+  if (argc >= 3 && (std::string(argv[2]) == "-h" ||
+                    std::string(argv[2]) == "--help")) {
+    PrintBenchUsage(argv[0]);
+    return 0;
+  }
+
+  if (argc < 3) {
+    std::cerr << "Missing model directory.\n";
+    PrintBenchUsage(argv[0]);
+    return 1;
+  }
+
+  std::string model_dir = argv[2];
+  std::string prompt = "hello";
+  int n_predict = 64;
+  unsigned int seed = 0;
+  std::string tokenizer_path;
+  bool verbose = false;
+  std::string quant_type;
+  int n_threads = 0;
+
+  for (int i = 3; i < argc; ++i) {
+    std::string arg = argv[i];
+    if ((arg == "-p" || arg == "--prompt") && i + 1 < argc) {
+      prompt = argv[++i];
+    } else if ((arg == "-n" || arg == "--n-predict") && i + 1 < argc) {
+      if (!ParseNonNegativeInt(argv[++i], n_predict)) {
+        std::cerr << "Invalid --n-predict value.\n";
+        return 1;
+      }
+    } else if (arg == "--seed" && i + 1 < argc) {
+      if (!ParseUnsigned(argv[++i], seed)) {
+        std::cerr << "Invalid --seed value.\n";
+        return 1;
+      }
+    } else if (arg == "--tokenizer" && i + 1 < argc) {
+      tokenizer_path = argv[++i];
+    } else if (arg == "--quant" && i + 1 < argc) {
+      quant_type = argv[++i];
+    } else if (arg == "--threads" && i + 1 < argc) {
+      if (!ParseNonNegativeInt(argv[++i], n_threads)) {
+        std::cerr << "Invalid --threads value.\n";
+        return 1;
+      }
+    } else if (arg == "--verbose") {
+      verbose = true;
+    } else if (arg == "-h" || arg == "--help") {
+      PrintBenchUsage(argv[0]);
+      return 0;
+    } else {
+      std::cerr << "Unknown argument: " << arg << "\n";
+      PrintBenchUsage(argv[0]);
+      return 1;
+    }
+  }
+
+  if (!quant_type.empty() && quant_type != "q8_0" && quant_type != "q4_0") {
+    std::cerr << "Invalid --quant value: " << quant_type
+              << ". Supported values: q8_0, q4_0.\n";
+    return 1;
+  }
+
+  mini_llama::MiniLlamaModel model = LoadWeightsFromPath(model_dir);
+  if (!model.loaded) {
+    std::cerr << "Failed to load model: " << model.load_error << "\n";
+    return 1;
+  }
+
+  const std::string resolved = ResolveModelPath(model_dir);
+  std::unique_ptr<mini_llama::ITokenizer> tokenizer =
+      LoadTokenizerForResolved(model_dir, resolved, tokenizer_path);
+  if (!tokenizer) {
+    std::cerr << "Failed to load tokenizer.\n";
+    return 1;
+  }
+  if (model.config.vocab_size < tokenizer->vocab_size()) {
+    std::cerr << "Model vocab_size must be at least "
+              << tokenizer->vocab_size() << " for the tokenizer.\n";
+    return 1;
+  }
+
+  std::vector<int> tokens = tokenizer->Encode(prompt);
+  if (tokens.empty()) {
+    std::cerr << "Prompt produced no tokens.\n";
+    return 1;
+  }
+  if (tokens.size() > static_cast<size_t>(model.config.max_seq_len)) {
+    std::cerr << "Prompt too long.\n";
+    return 1;
+  }
+  if (tokens.size() + static_cast<size_t>(n_predict) >
+      static_cast<size_t>(model.config.max_seq_len)) {
+    n_predict = model.config.max_seq_len - static_cast<int>(tokens.size());
+  }
+
+  mini_llama::MiniLlamaModel baseline_model;
+  if (!quant_type.empty()) {
+    baseline_model = model;
+  }
+  try {
+    ApplyQuantOverride(model, quant_type);
+  } catch (const std::exception& e) {
+    std::cerr << "Quantization failed: " << e.what() << "\n";
+    return 1;
+  }
+
+  std::cout << "Benchmark: " << model_dir << "\n";
+  std::cout << "  backend: cpu\n";
+  std::cout << "  compute: cpu\n";
+  std::cout << "  prompt: \"" << prompt << "\" (" << tokens.size()
+            << " tokens)\n";
+  mini_llama::SetThreadCount(n_threads);
+  std::cout << "  n_predict: " << n_predict << "\n";
+  std::cout << "  seed: " << seed << "\n";
+  std::cout << "  quant: " << (quant_type.empty() ? "model-native" : quant_type)
+            << "\n";
+  std::cout << "  threads: " << mini_llama::GetThreadCount() << "\n";
+  std::cout << "  verbose: " << (verbose ? "true" : "false") << "\n\n";
+
+  mini_llama::BenchmarkResult result =
+      mini_llama::RunBenchmark(model, tokens, n_predict, seed, verbose);
+
+  std::cout << "Results:\n";
+  std::cout << "  prompt tokens:     " << result.n_prompt_tokens << "\n";
+  std::cout << "  generated tokens:  " << result.n_generated_tokens << "\n";
+  std::cout << "  Decode tokens:     " << result.n_decode_tokens << "\n";
+  std::cout << "  prefill time:      " << std::fixed << std::setprecision(2)
+            << result.prefill_ms << " ms\n";
+  std::cout << "  Decode time:       " << std::fixed << std::setprecision(2)
+            << result.decode_ms << " ms\n";
+  std::cout << "  total time:        " << std::fixed << std::setprecision(2)
+            << (result.prefill_ms + result.decode_ms) << " ms\n";
+  std::cout << "  tokens/s (total):  " << std::fixed << std::setprecision(2)
+            << result.tokens_per_sec() << "\n";
+  std::cout << "  tokens/s (Decode): " << std::fixed << std::setprecision(2)
+            << result.decode_tokens_per_sec() << "\n";
+
+  size_t actual_bytes = mini_llama::ModelWeightBytes(model);
+  size_t f32_bytes = mini_llama::ModelWeightBytesF32(model);
+  std::cout << "\n  weight memory:\n";
+  std::cout << "    actual:    " << actual_bytes << " bytes (" << std::fixed
+            << std::setprecision(2) << (actual_bytes / (1024.0 * 1024.0))
+            << " MB)\n";
+  std::cout << "    f32 equiv: " << f32_bytes << " bytes (" << std::fixed
+            << std::setprecision(2) << (f32_bytes / (1024.0 * 1024.0))
+            << " MB)\n";
+  double savings = actual_bytes == 0
+                       ? 0.0
+                       : static_cast<double>(f32_bytes) / actual_bytes;
+  std::cout << "    savings:   " << std::fixed << std::setprecision(2)
+            << savings << "x compression\n";
+
+  if (!quant_type.empty()) {
+    try {
+      mini_llama::Tensor baseline_logits =
+          RunLogitsForTokens(baseline_model, tokens);
+      mini_llama::Tensor quant_logits = RunLogitsForTokens(model, tokens);
+      auto err = LogitsError(baseline_logits, quant_logits);
+
+      std::cout << "\n  logits error vs model-native:\n";
+      std::cout << "    max:  " << std::scientific << std::setprecision(3)
+                << err.first << "\n";
+      std::cout << "    mean: " << std::scientific << std::setprecision(3)
+                << err.second << "\n";
+    } catch (const std::exception& e) {
+      std::cerr << "Failed to compute logits error: " << e.what() << "\n";
+      return 1;
+    }
+  }
+
   return 0;
 }
 
@@ -1007,6 +1292,10 @@ int main(int argc, char** argv) {
 
   if (command == "run") {
     return RunChat(argc, argv);
+  }
+
+  if (command == "bench") {
+    return RunBench(argc, argv);
   }
 
   std::cerr << "unknown command: " << command << "\n";

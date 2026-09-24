@@ -2,7 +2,7 @@
 
 从零实现的 LLaMA 风格 C++ 推理引擎，按课程步骤逐步搭建。
 
-当前进度：**真实模型端到端 Smoke Test** — 用真实 Qwen2 GGUF 跑通 `inspect-gguf`、`generate` 和 `run`，确认整条链路能加载、能分词、能前向、能采样、能退出。
+当前进度：**Benchmark 设计** — 给性能一个固定测量入口。`bench` 把一次推理拆成 prompt tokens、generated tokens、prefill / decode 耗时、tokens/s 和权重内存。
 
 前面几章已经把真实模型路径上的关键模块接起来了：
 
@@ -12,7 +12,7 @@
 - `PromptBuilder` 负责把对话消息拼成 Qwen2 ChatML prompt。
 - Forward、KV Cache 和 Sampler 负责完成自回归生成。
 
-Smoke test 只判断链路是否稳定可用。短输出的内容质量不代表模型完整能力，尤其是 `-n 1` 或 `-n 3` 这种极短生成。本仓库是 CPU 路径，不包含 CUDA / `--quant`。
+Smoke test 只判断链路是否稳定可用。短输出的内容质量不代表模型完整能力，尤其是 `-n 1` 或 `-n 3` 这种极短生成。本仓库是 CPU 路径，不包含 CUDA。`bench --quant q8_0|q4_0` 会在加载后临时量化 Linear 权重，用来对照体积和 logits 误差。
 
 ## 环境要求
 
@@ -86,6 +86,10 @@ models/chat/
 ./build/mini-llama inspect-gguf models/chat/Qwen2-0.5B-Instruct-Q8_0.gguf
 ./build/mini-llama run models/tiny -n 8
 ./build/mini-llama run models/chat -n 8
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --verbose
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --quant q8_0
+./build/mini-llama bench models/chat -p hello -n 32 --seed 1 --threads 4
 ```
 
 `generate` 默认加载 `models/tiny` 的 JSON+BIN。`inspect` 先打印清单，再完整读入权重。JSON+BIN 当前 dtype 固定为 float32。
@@ -93,6 +97,165 @@ models/chat/
 内置命令：`/help` `/clear` `/stats` `/params` `/exit`。`/clear` 会重建 `MiniLlamaContext`，避免 KV Cache 的 `pos` 与文本长度错位。
 
 `run models/chat` 会自动解析目录里的可推理 GGUF；加载失败会直接报错退出，即使同目录有 `vocab.json` 也不会改用合成权重。教学对话用 `run models/tiny` 或显式 `run models/tiny --synthetic`。目录里的 inspect 夹具 `test.gguf` 不会被当成聊天模型。
+
+## Benchmark 设计
+
+真实模型已经能跑起来之后，需要一个固定的测速入口。手动观察「感觉快了」没有意义，性能优化要看可测量的数据。
+
+`bench` 子命令负责把一次推理拆成几类指标：
+
+- prompt 有多少 token。
+- 生成了多少 token。
+- prefill 花了多少时间。
+- decode 花了多少时间。
+- 总 tokens/s 和 decode tokens/s 分别是多少。
+- 权重实际占用多少内存，等价 F32 权重需要多少内存。
+
+对应代码集中在：
+
+- `include/mini_llama/debug.h`
+- `src/debug.cc`
+- `src/main.cc`
+- `tests/test_debug.cc`
+
+### 为什么要分开看 prefill 和 decode
+
+一次生成通常分成两段。
+
+**Prefill** 把 prompt token 一次性喂进模型，得到最后一个位置的 logits。prompt 越长，这一步处理的 token 越多。它更像批量计算，矩阵乘法和 attention 都能一次处理多 token。
+
+**Decode** 生成阶段每次只新增一个 token。每生成一个 token，都要把这个 token 再送回模型，读权重、读 KV cache、算下一个 logits。用户看到的「输出速度」主要取决于 decode 阶段。
+
+所以 benchmark 同时输出：
+
+```text
+prefill time
+Decode time
+tokens/s (total)
+tokens/s (Decode)
+```
+
+这几个数字不要混着看。长 prompt 会放大 prefill；长生成会让 decode 更稳定；`-n 1` 只适合 smoke，不能代表稳定吞吐。
+
+### BenchmarkResult 记录什么
+
+`BenchmarkResult` 定义在 `include/mini_llama/debug.h`：
+
+- `n_generated_tokens` 包含所有生成 token。
+- `n_decode_tokens` 从第二个生成 token 开始计数。
+
+原因在 `RunBenchmark()` 里：第一个 token 是从 prefill 后的 logits 直接采样出来的，还没有进入单 token decode forward。后续 token 才会走 `MiniBatch::Single()`。因此 `-n 4` 通常会看到：
+
+```text
+generated tokens: 4
+Decode tokens:    3
+```
+
+吞吐公式：
+
+- `tokens/s (total)` = `generated_tokens / (prefill_ms + decode_ms)`
+- `tokens/s (Decode)` = `decode_tokens / decode_ms`
+
+### bench 命令参数
+
+入口：
+
+```bash
+./build/mini-llama bench <model-path|dir> [options]
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `-p, --prompt <str>` | 输入 prompt，默认 `"hello"` |
+| `-n, --n-predict <n>` | 生成 token 数，默认 64 |
+| `--seed <S>` | 采样种子，默认 0 |
+| `--tokenizer <path>` | 显式指定 vocab.json |
+| `--quant q8_0\|q4_0` | benchmark 前先量化 Linear 权重 |
+| `--threads <n>` | 设置 CPU 并行线程数，0 表示自动 |
+| `--verbose` | 打印调试信息 |
+
+基础 tiny benchmark：
+
+```bash
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42
+```
+
+真实 Qwen2 benchmark：
+
+```bash
+./build/mini-llama bench models/chat \
+  -p hello \
+  -n 32 \
+  --seed 1
+```
+
+指定线程数：
+
+```bash
+./build/mini-llama bench models/chat \
+  -p hello \
+  -n 32 \
+  --seed 1 \
+  --threads 4
+```
+
+量化后测速：
+
+```bash
+./build/mini-llama bench models/tiny \
+  -p hello \
+  -n 4 \
+  --seed 42 \
+  --quant q8_0
+```
+
+本仓库只走 CPU。CUDA backend 指标（uploaded weights、host/device copy、GPU kernel 调用次数）等进入后续 CUDA 章节后再作为 GPU benchmark 的判断依据。当前先把 CPU 路径测准。
+
+### 输出怎么看
+
+```bash
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --verbose
+```
+
+关键字段：
+
+- `prompt: "hello" (6 tokens)`：输入 prompt 编码后的 token 数。
+- `generated tokens`：本次生成出的 token 数。
+- `Decode tokens`：真正走单 token decode forward 的次数。
+- `prefill time`：prompt 一次性前向的耗时。
+- `Decode time`：decode loop 的累计耗时。
+- `tokens/s (total)`：`generated_tokens / (prefill_ms + decode_ms)`。
+- `tokens/s (Decode)`：`decode_tokens / decode_ms`。
+- `weight memory actual`：当前模型权重实际占用。
+- `f32 equiv`：同样权重如果全用 F32 存储的占用。
+- `savings`：F32 等价体积除以实际体积。
+
+### verbose 模式能看到什么
+
+`--verbose` 会打印三类调试信息。
+
+**Logits shape 和 top-k**：确认最后输出的 logits 形状是否等于 vocab size，也能看到采样前分数最高的 token id。
+
+**KV cache 状态**：确认层数、上下文长度、KV head 数和 `head_dim` 是否和模型配置一致。
+
+**Decode step**：看到每一步采样出来的 token id。需要继续看文本时，可以用 tokenizer decode 或 `generate` 命令的 `generated text` 输出对照。
+
+### 量化对 benchmark 的影响
+
+`bench` 支持在加载模型后临时执行量化。核心看点有两个：
+
+- `weight memory` 显示量化后的权重体积是否下降。
+- `logits error vs model-native` 显示量化前后 logits 的最大误差和平均误差。
+
+吞吐是否提升要看模型大小、CPU 缓存、线程数、SIMD 路径和量化 kernel。tiny 模型太小，结果容易被函数调用开销和计时抖动影响；真实模型更适合看稳定趋势。
+
+### 多线程 benchmark 怎么看
+
+对比线程数时，保持 prompt、`-n`、seed、模型和量化参数一致，只改 `--threads`。重点看 `tokens/s (Decode)`。
+
+decode 阶段每次只处理一个新 token，能不能加速取决于矩阵尺寸、线程调度开销、内存带宽、量化格式和 CPU 缓存。线程数更多不一定线性更快，所以 benchmark 结果要按本机实测来判断。
 
 ## 真实模型端到端 Smoke Test
 
@@ -267,24 +430,23 @@ Qwen2-0.5B-Q8_0 加载后还会分配 KV Cache 和中间张量。内存紧张时
 
 ## 本章验证
 
-真实模型 smoke 通过时，至少应该看到：
+检查 benchmark 模块时，建议确认这些结果：
 
-- `inspect-gguf` 能打印 GGUF info、metadata 和 tensor 列表。
-- `generate` 能打印 prompt token、generated token 和 `trace summary ... status=ok`。
-- `run` 能进入交互界面，至少完成一轮输入和退出。
-- `/stats` 能显示会话统计。
-- `ctest --test-dir build -R mini-llama-tests --output-on-failure` 通过。
+- `bench models/tiny -p hello -n 4 --seed 42` 能输出 `Results`。
+- `generated tokens` 和 `Decode tokens` 的关系符合 `n_predict=4`、`Decode tokens=3`。
+- `--verbose` 能打印 logits top-k、KV cache shape 和 Decode step。
+- `--quant q8_0` 能打印 `weight memory` 和 `logits error vs model-native`。
+- `--threads` 能改变输出里的 `threads` 字段。
 
 建议运行：
 
 ```bash
 cmake --build build -j4
 ctest --test-dir build -R mini-llama-tests --output-on-failure
-./build/mini-llama inspect-gguf models/chat/Qwen2-0.5B-Instruct-Q8_0.gguf
-./build/mini-llama generate \
-  --model models/chat/Qwen2-0.5B-Instruct-Q8_0.gguf \
-  -p hello \
-  -n 1
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --verbose
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --quant q8_0
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --threads 4
 ```
 
 ## 目录结构
@@ -304,6 +466,7 @@ mini-llama/
 │   ├── batch.h             Prefill/Decode 统一 MiniBatch
 │   ├── forward.h           ForwardToken / ForwardBatch
 │   ├── sampler.h           SamplingParams + MiniSampler
+│   ├── debug.h             BenchmarkResult + dump helpers
 │   ├── radix_tree.h        压缩前缀树
 │   ├── request_context.h   请求级 trace
 │   ├── chat.h              ChatSession + prefix_cache
@@ -336,7 +499,8 @@ mini-llama/
     ├── test_chat.cc
     ├── test_loader.cc
     ├── test_gguf.cc
-    └── test_gguf_loader.cc
+    ├── test_gguf_loader.cc
+    └── test_debug.cc
 ```
 
 ## Forward 主链路
@@ -352,7 +516,7 @@ mini-llama/
 
 GQA：`kv_head = q_head / (n_heads / n_kv_heads)`。Attention 点积后除以 `sqrt(head_dim)`，多头之间用 `ParallelFor` 无锁并行。
 
-本仓库只走 **CPU**。Q8_0 / Q4_0 / Q4_1 权重会在 CPU 上反量化后参与计算；CUDA device-resident 路径未接入。
+本仓库只走 **CPU**。Q8_0 / Q4_0 / Q4_1 权重会在 CPU 上按块反量化后参与计算；`bench --quant` 可把已加载的 Linear 权重临时转成 Q8_0 / Q4_0。CUDA device-resident 路径未接入。
 
 ## Sampler
 

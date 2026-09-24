@@ -34,6 +34,7 @@ set(MINI_LLAMA_CORE_SOURCES
   src/loader.cc
   src/forward.cc
   src/sampler.cc
+  src/debug.cc
 )
 
 add_executable(mini-llama
@@ -59,6 +60,7 @@ set(TEST_SOURCES
   tests/test_loader.cc
   tests/test_gguf.cc
   tests/test_gguf_loader.cc
+  tests/test_debug.cc
 )
 
 add_executable(mini-llama-tests ${TEST_SOURCES})

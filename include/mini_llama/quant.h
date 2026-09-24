@@ -10,6 +10,9 @@
 
 namespace mini_llama {
 
+std::vector<BlockQ80> QuantizeToQ80(const Tensor& src);
+std::vector<BlockQ40> QuantizeToQ40(const Tensor& src);
+
 Tensor DequantizeFromQ80(const std::vector<BlockQ80>& blocks,
                          const std::vector<int>& shape);
 Tensor DequantizeFromQ40(const std::vector<BlockQ40>& blocks,

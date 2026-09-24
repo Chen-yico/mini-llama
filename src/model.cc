@@ -5,6 +5,7 @@
 
 #include <stdexcept>
 
+#include "mini_llama/quant.h"
 #include "mini_llama/quantized_tensor.h"
 
 namespace mini_llama {
@@ -91,6 +92,146 @@ MiniLlamaModel MakeCpuTestModel(ModelConfig config) {
 
   model.loaded = true;
   return model;
+}
+
+namespace {
+
+size_t TensorBytes(const Tensor& t) {
+  return t.data.size() * sizeof(float);
+}
+
+size_t QuantizedTensorBytes(const QuantizedTensor& qt) {
+  switch (qt.type) {
+    case QuantType::kF32:
+      return qt.f32_data.size() * sizeof(float);
+    case QuantType::kQ80:
+      return qt.q8_0_data.size() * sizeof(BlockQ80);
+    case QuantType::kQ40:
+      return qt.q4_0_data.size() * sizeof(BlockQ40);
+    case QuantType::kQ41:
+      return qt.q4_1_data.size() * sizeof(BlockQ41);
+  }
+  return 0;
+}
+
+size_t QuantizedTensorBytesF32(const QuantizedTensor& qt) {
+  return qt.num_elements() * sizeof(float);
+}
+
+Tensor QuantizedTensorToF32(const QuantizedTensor& qt) {
+  switch (qt.type) {
+    case QuantType::kF32:
+      return ToTensor(qt);
+    case QuantType::kQ80:
+      return DequantizeFromQ80(qt.q8_0_data, qt.shape);
+    case QuantType::kQ40:
+      return DequantizeFromQ40(qt.q4_0_data, qt.shape);
+    case QuantType::kQ41:
+      return DequantizeFromQ41(qt.q4_1_data, qt.shape);
+  }
+  throw std::runtime_error("quantized_tensor_to_f32: unknown quant type");
+}
+
+void QuantizeQtToQ80(QuantizedTensor& qt) {
+  if (qt.type == QuantType::kQ80) {
+    return;
+  }
+  Tensor t = QuantizedTensorToF32(qt);
+  qt.q8_0_data = QuantizeToQ80(t);
+  qt.type = QuantType::kQ80;
+  qt.f32_data.clear();
+  qt.f32_data.shrink_to_fit();
+  qt.q4_0_data.clear();
+  qt.q4_0_data.shrink_to_fit();
+  qt.q4_1_data.clear();
+  qt.q4_1_data.shrink_to_fit();
+}
+
+void QuantizeQtToQ40(QuantizedTensor& qt) {
+  if (qt.type == QuantType::kQ40) {
+    return;
+  }
+  Tensor t = QuantizedTensorToF32(qt);
+  qt.q4_0_data = QuantizeToQ40(t);
+  qt.type = QuantType::kQ40;
+  qt.f32_data.clear();
+  qt.f32_data.shrink_to_fit();
+  qt.q8_0_data.clear();
+  qt.q8_0_data.shrink_to_fit();
+  qt.q4_1_data.clear();
+  qt.q4_1_data.shrink_to_fit();
+}
+
+}  // namespace
+
+size_t ModelWeightBytes(const MiniLlamaModel& model) {
+  size_t bytes = 0;
+  bytes += TensorBytes(model.token_embedding);
+  bytes += TensorBytes(model.final_norm);
+  bytes += QuantizedTensorBytes(model.lm_head);
+  for (const auto& lw : model.layers) {
+    bytes += TensorBytes(lw.attention_norm);
+    bytes += QuantizedTensorBytes(lw.wq);
+    bytes += QuantizedTensorBytes(lw.wk);
+    bytes += QuantizedTensorBytes(lw.wv);
+    bytes += TensorBytes(lw.bq);
+    bytes += TensorBytes(lw.bk);
+    bytes += TensorBytes(lw.bv);
+    bytes += QuantizedTensorBytes(lw.wo);
+    bytes += TensorBytes(lw.ffn_norm);
+    bytes += QuantizedTensorBytes(lw.w_gate);
+    bytes += QuantizedTensorBytes(lw.w_up);
+    bytes += QuantizedTensorBytes(lw.w_down);
+  }
+  return bytes;
+}
+
+size_t ModelWeightBytesF32(const MiniLlamaModel& model) {
+  size_t bytes = 0;
+  bytes += TensorBytes(model.token_embedding);
+  bytes += TensorBytes(model.final_norm);
+  bytes += QuantizedTensorBytesF32(model.lm_head);
+  for (const auto& lw : model.layers) {
+    bytes += TensorBytes(lw.attention_norm);
+    bytes += QuantizedTensorBytesF32(lw.wq);
+    bytes += QuantizedTensorBytesF32(lw.wk);
+    bytes += QuantizedTensorBytesF32(lw.wv);
+    bytes += TensorBytes(lw.bq);
+    bytes += TensorBytes(lw.bk);
+    bytes += TensorBytes(lw.bv);
+    bytes += QuantizedTensorBytesF32(lw.wo);
+    bytes += TensorBytes(lw.ffn_norm);
+    bytes += QuantizedTensorBytesF32(lw.w_gate);
+    bytes += QuantizedTensorBytesF32(lw.w_up);
+    bytes += QuantizedTensorBytesF32(lw.w_down);
+  }
+  return bytes;
+}
+
+void QuantizeModelToQ80(MiniLlamaModel& model) {
+  QuantizeQtToQ80(model.lm_head);
+  for (auto& lw : model.layers) {
+    QuantizeQtToQ80(lw.wq);
+    QuantizeQtToQ80(lw.wk);
+    QuantizeQtToQ80(lw.wv);
+    QuantizeQtToQ80(lw.wo);
+    QuantizeQtToQ80(lw.w_gate);
+    QuantizeQtToQ80(lw.w_up);
+    QuantizeQtToQ80(lw.w_down);
+  }
+}
+
+void QuantizeModelToQ40(MiniLlamaModel& model) {
+  QuantizeQtToQ40(model.lm_head);
+  for (auto& lw : model.layers) {
+    QuantizeQtToQ40(lw.wq);
+    QuantizeQtToQ40(lw.wk);
+    QuantizeQtToQ40(lw.wv);
+    QuantizeQtToQ40(lw.wo);
+    QuantizeQtToQ40(lw.w_gate);
+    QuantizeQtToQ40(lw.w_up);
+    QuantizeQtToQ40(lw.w_down);
+  }
 }
 
 }  // namespace mini_llama

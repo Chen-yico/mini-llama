@@ -2,6 +2,7 @@
 
 #include "mini_llama/batch.h"
 #include "mini_llama/chat.h"
+#include "mini_llama/debug.h"
 #include "mini_llama/context.h"
 #include "mini_llama/forward.h"
 #include "mini_llama/gguf.h"
@@ -23,12 +24,16 @@
 #include "mini_llama/tokenizer.h"
 
 using mini_llama::ArgMax;
+using mini_llama::BenchmarkResult;
 using mini_llama::BlockQ40;
 using mini_llama::BlockQ41;
 using mini_llama::BlockQ80;
 using mini_llama::DequantizeFromQ40;
 using mini_llama::DequantizeFromQ41;
 using mini_llama::DequantizeFromQ80;
+using mini_llama::DumpKvCacheInfo;
+using mini_llama::DumpLogitsTopK;
+using mini_llama::DumpTensorShape;
 using mini_llama::AsciiTokenizer;
 using mini_llama::BpeTokenizer;
 using mini_llama::ChatMessage;
@@ -84,7 +89,12 @@ using mini_llama::PromptBuilder;
 using mini_llama::QuantizedTensor;
 using mini_llama::QuantType;
 using mini_llama::RequestContext;
+using mini_llama::QuantizeModelToQ40;
+using mini_llama::QuantizeModelToQ80;
+using mini_llama::QuantizeToQ40;
+using mini_llama::QuantizeToQ80;
 using mini_llama::RmsNorm;
+using mini_llama::RunBenchmark;
 using mini_llama::Rope;
 using mini_llama::RopeType;
 using mini_llama::SampleGreedy;

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -56,5 +57,19 @@ struct MiniLlamaModel {
 
 // Allocate F32 weights and fill them with deterministic values for tests / CLI.
 MiniLlamaModel MakeCpuTestModel(ModelConfig config = {});
+
+// Bytes consumed by model weights in their current storage format.
+size_t ModelWeightBytes(const MiniLlamaModel& model);
+
+// Bytes the same weights would consume if stored as F32.
+size_t ModelWeightBytesF32(const MiniLlamaModel& model);
+
+// Convert Linear weight QuantizedTensors from F32 (or other) to Q8_0 in-place.
+// Embedding, norm, and bias tensors remain unchanged.
+void QuantizeModelToQ80(MiniLlamaModel& model);
+
+// Convert Linear weight QuantizedTensors from F32 (or other) to Q4_0 in-place.
+// Embedding, norm, and bias tensors remain unchanged.
+void QuantizeModelToQ40(MiniLlamaModel& model);
 
 }  // namespace mini_llama
