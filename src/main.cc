@@ -39,7 +39,8 @@ void PrintUsage(const char* program) {
       << "  " << program << " --help\n"
       << "  " << program
       << " generate [--model path|dir] [--tokenizer vocab.json] [-p prompt] "
-         "[-n tokens] [--temperature T] [--top-k k] [--seed S] [--threads N]\n"
+         "[-n tokens] [--temperature T] [--top-k k] [--seed S] [--threads N] "
+         "[--quant q8_0|q4_0]\n"
       << "  " << program << " inspect <model-path|dir>\n"
       << "  " << program << " inspect-gguf <path>\n"
       << "  " << program
@@ -380,6 +381,7 @@ int RunGenerate(int argc, char** argv) {
   mini_llama::SamplingParams sampling_params;
   std::string model_path = "models/tiny";
   std::string explicit_tokenizer_path;
+  std::string quant_type;
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
@@ -446,6 +448,12 @@ int RunGenerate(int argc, char** argv) {
         return 1;
       }
       explicit_tokenizer_path = argv[++i];
+    } else if (arg == "--quant") {
+      if (i + 1 >= argc) {
+        std::cerr << "missing value for " << arg << "\n";
+        return 1;
+      }
+      quant_type = argv[++i];
     } else if (arg == "-h" || arg == "--help") {
       PrintUsage(argv[0]);
       return 0;
@@ -453,6 +461,12 @@ int RunGenerate(int argc, char** argv) {
       std::cerr << "unknown option: " << arg << "\n";
       return 1;
     }
+  }
+
+  if (!quant_type.empty() && quant_type != "q8_0" && quant_type != "q4_0") {
+    std::cerr << "Invalid --quant value: " << quant_type
+              << ". Supported values: q8_0, q4_0.\n";
+    return 1;
   }
 
   PrintCpuBanner();
@@ -468,7 +482,13 @@ int RunGenerate(int argc, char** argv) {
   if (!model.loaded) {
     return FailRequest(request, "Failed to load model: " + model.load_error);
   }
-  request.RecordEvent("quantize", 0.0, 0, "model-native");
+  const std::string quant_label = quant_type.empty() ? "model-native" : quant_type;
+  try {
+    ApplyQuantOverride(model, quant_type);
+  } catch (const std::exception& e) {
+    return FailRequest(request, "Quantization failed: " + std::string(e.what()));
+  }
+  request.RecordEvent("quantize", 0.0, 0, quant_label);
 
   std::unique_ptr<mini_llama::ITokenizer> tokenizer;
   if (EndsWithGguf(resolved)) {
@@ -536,7 +556,7 @@ int RunGenerate(int argc, char** argv) {
   std::cout << "sampling: temperature=" << sampling_params.temperature
             << ", top_k=" << sampling_params.top_k
             << ", seed=" << sampling_params.seed << "\n"
-            << "quant: model-native\n"
+            << "quant: " << quant_label << "\n"
             << "threads: " << mini_llama::GetThreadCount() << "\n\n";
 
   if (tokens.empty()) {

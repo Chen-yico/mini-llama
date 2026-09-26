@@ -12,7 +12,13 @@
 #include <string>
 #include <vector>
 
+#include "mini_llama/ops.h"
 #include "mini_llama/thread_pool.h"
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define MINI_LLAMA_USE_NEON 1
+#endif
 
 namespace mini_llama {
 namespace {
@@ -452,11 +458,106 @@ float DequantQ41(const BlockQ41& block, int idx) {
 
 }  // namespace
 
+#ifdef MINI_LLAMA_USE_NEON
+Tensor LinearQ80(const Tensor& x, const std::vector<BlockQ80>& weight,
+                 const std::vector<int>& weight_shape) {
+  if (weight_shape.size() != 2) {
+    throw std::runtime_error("LinearQ80: expected 2D weight shape");
+  }
+
+  int in_features = 0;
+  int rows = 1;
+  bool is_1d = false;
+  if (x.num_dims() == 1) {
+    in_features = x.shape[0];
+    is_1d = true;
+  } else if (x.num_dims() == 2) {
+    rows = x.shape[0];
+    in_features = x.shape[1];
+  } else {
+    throw std::runtime_error(
+        "LinearQ80: expected x shape [in_features] or [batch, in_features], "
+        "got " +
+        x.ShapeStringShort());
+  }
+
+  int out_features = weight_shape[0];
+  if (weight_shape[1] != in_features) {
+    throw std::runtime_error(
+        "LinearQ80: dimension mismatch x=" + x.ShapeStringShort() +
+        " weight=" +
+        QuantizedTensor{QuantType::kF32, weight_shape}.ShapeStringShort());
+  }
+
+  int n_blocks_per_row = (in_features + kQ80BlockSize - 1) / kQ80BlockSize;
+  size_t expected_blocks =
+      static_cast<size_t>(out_features) * static_cast<size_t>(n_blocks_per_row);
+  if (weight.size() != expected_blocks) {
+    throw std::runtime_error("LinearQ80: block count mismatch: expected " +
+                             std::to_string(expected_blocks) + ", got " +
+                             std::to_string(weight.size()));
+  }
+
+  Tensor result(is_1d ? std::vector<int>{out_features}
+                      : std::vector<int>{rows, out_features},
+                0.0f);
+
+  ParallelFor(rows * out_features, [&](int begin, int end) {
+    for (int flat_index = begin; flat_index < end; ++flat_index) {
+      int row = flat_index / out_features;
+      int j = flat_index % out_features;
+      const float* x_row =
+          x.data.data() + static_cast<size_t>(row) * in_features;
+      int block_base = j * n_blocks_per_row;
+      float32x4_t sum_vec = vdupq_n_f32(0.0f);
+      float sum_scalar = 0.0f;
+
+      for (int b = 0; b < n_blocks_per_row; ++b) {
+        const BlockQ80& block = weight[static_cast<size_t>(block_base + b)];
+        float d = Fp16ToFloat(block.d);
+        int base_k = b * kQ80BlockSize;
+        int k_end = std::min(base_k + kQ80BlockSize, in_features);
+        int k = base_k;
+        for (; k + 8 <= k_end; k += 8) {
+          int8x8_t q8 = vld1_s8(block.qs + (k - base_k));
+          int16x8_t q16 = vmovl_s8(q8);
+          int32x4_t q32_lo = vmovl_s16(vget_low_s16(q16));
+          int32x4_t q32_hi = vmovl_s16(vget_high_s16(q16));
+          float32x4_t qf_lo = vmulq_n_f32(vcvtq_f32_s32(q32_lo), d);
+          float32x4_t qf_hi = vmulq_n_f32(vcvtq_f32_s32(q32_hi), d);
+          float32x4_t xf_lo = vld1q_f32(x_row + k);
+          float32x4_t xf_hi = vld1q_f32(x_row + k + 4);
+          sum_vec = vfmaq_f32(sum_vec, qf_lo, xf_lo);
+          sum_vec = vfmaq_f32(sum_vec, qf_hi, xf_hi);
+        }
+
+        float32x2_t sum_lo = vget_low_f32(sum_vec);
+        float32x2_t sum_hi = vget_high_f32(sum_vec);
+        sum_lo = vadd_f32(sum_lo, sum_hi);
+        float32x2_t sum_fp = vpadd_f32(sum_lo, sum_lo);
+        sum_scalar += vget_lane_f32(sum_fp, 0);
+        sum_vec = vdupq_n_f32(0.0f);
+
+        for (; k < k_end; ++k) {
+          float w = d * static_cast<float>(block.qs[k - base_k]);
+          sum_scalar += w * x_row[k];
+        }
+      }
+
+      result.data[static_cast<size_t>(row) * out_features +
+                  static_cast<size_t>(j)] = sum_scalar;
+    }
+  });
+
+  return result;
+}
+#else
 Tensor LinearQ80(const Tensor& x, const std::vector<BlockQ80>& weight,
                  const std::vector<int>& weight_shape) {
   return LinearQuantizedImpl<BlockQ80, kQ80BlockSize>(x, weight, weight_shape,
                                                       DequantQ80);
 }
+#endif
 
 Tensor LinearQ40(const Tensor& x, const std::vector<BlockQ40>& weight,
                  const std::vector<int>& weight_shape) {
@@ -468,6 +569,30 @@ Tensor LinearQ41(const Tensor& x, const std::vector<BlockQ41>& weight,
                  const std::vector<int>& weight_shape) {
   return LinearQuantizedImpl<BlockQ41, kQ41BlockSize>(x, weight, weight_shape,
                                                       DequantQ41);
+}
+
+Tensor MatmulQ80(const std::vector<BlockQ80>& weight, const Tensor& input,
+                 const std::vector<int>& weight_shape) {
+  Tensor weight_f32 = DequantizeFromQ80(weight, weight_shape);
+  return Matmul(weight_f32, input);
+}
+
+float CompareMatmulError(const Tensor& weight, const Tensor& input) {
+  Tensor f32_result = Matmul(weight, input);
+  std::vector<BlockQ80> qweight = QuantizeToQ80(weight);
+  Tensor q8_result = MatmulQ80(qweight, input, weight.shape);
+  if (f32_result.shape != q8_result.shape) {
+    throw std::runtime_error("CompareMatmulError: shape mismatch");
+  }
+
+  float max_err = 0.0f;
+  for (size_t i = 0; i < f32_result.size(); ++i) {
+    float err = std::abs(f32_result.data[i] - q8_result.data[i]);
+    if (err > max_err) {
+      max_err = err;
+    }
+  }
+  return max_err;
 }
 
 }  // namespace mini_llama
