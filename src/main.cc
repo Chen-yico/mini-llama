@@ -483,12 +483,14 @@ int RunGenerate(int argc, char** argv) {
     return FailRequest(request, "Failed to load model: " + model.load_error);
   }
   const std::string quant_label = quant_type.empty() ? "model-native" : quant_type;
+  stage_start = mini_llama::RequestClock::now();
   try {
     ApplyQuantOverride(model, quant_type);
   } catch (const std::exception& e) {
     return FailRequest(request, "Quantization failed: " + std::string(e.what()));
   }
-  request.RecordEvent("quantize", 0.0, 0, quant_label);
+  request.RecordEvent("quantize", mini_llama::ElapsedMs(stage_start), 0,
+                      quant_label);
 
   std::unique_ptr<mini_llama::ITokenizer> tokenizer;
   if (EndsWithGguf(resolved)) {
