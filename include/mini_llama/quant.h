@@ -27,4 +27,12 @@ Tensor LinearQ40(const Tensor& x, const std::vector<BlockQ40>& weight,
 Tensor LinearQ41(const Tensor& x, const std::vector<BlockQ41>& weight,
                  const std::vector<int>& weight_shape);
 
+// Dequantize the whole Q8_0 weight, then call F32 Matmul.
+// Kept to measure quantization error. Inference uses LinearQ80.
+Tensor MatmulQ80(const std::vector<BlockQ80>& weight, const Tensor& input,
+                 const std::vector<int>& weight_shape);
+
+// Max absolute error between F32 Matmul and MatmulQ80.
+float CompareMatmulError(const Tensor& weight, const Tensor& input);
+
 }  // namespace mini_llama

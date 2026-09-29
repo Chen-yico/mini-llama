@@ -2,7 +2,7 @@
 
 从零实现的 LLaMA 风格 C++ 推理引擎，按课程步骤逐步搭建。
 
-当前进度：**Benchmark 设计** — 给性能一个固定测量入口。`bench` 把一次推理拆成 prompt tokens、generated tokens、prefill / decode 耗时、tokens/s 和权重内存。
+当前进度：**Q8_0 量化** — 把线性层 F32 权重收成 34 字节 block，推理时按块反量化，避免把整份权重展开回 F32。
 
 前面几章已经把真实模型路径上的关键模块接起来了：
 
@@ -81,6 +81,7 @@ models/chat/
 ./build/mini-llama --help
 ./build/mini-llama generate -p "hello mini llama" -n 8
 ./build/mini-llama generate -p "hello" -n 8 --temperature 0.8 --top-k 20 --seed 42
+./build/mini-llama generate --model models/tiny --quant q8_0 -p hello -n 4
 ./build/mini-llama inspect models/tiny
 ./build/mini-llama inspect-gguf models/tiny/test.gguf
 ./build/mini-llama inspect-gguf models/chat/Qwen2-0.5B-Instruct-Q8_0.gguf
@@ -428,25 +429,54 @@ Qwen2-0.5B-Q8_0 加载后还会分配 KV Cache 和中间张量。内存紧张时
 - 关闭其他占用内存的进程。
 - 换更小或更高压缩比的 GGUF 模型做链路验证。
 
+## Q8_0 量化
+
+F32 每个权重 4 字节。Decode 每生成一个 token 都要反复读线性层权重，模型越大，读权重越容易成为主要成本。
+
+Q8_0 每 32 个浮点收成一个 block：1 个 FP16 scale（2 字节）加 32 个 int8（32 字节），共 34 字节。32 个 F32 原来是 128 字节，单个 block 的理论压缩比是 `128 / 34 ≈ 3.76x`。
+
+`BlockQ80` 定义在 `include/mini_llama/quantized_tensor.h`，布局对齐 ggml / llama.cpp 的 `block_q8_0`：
+
+- `d`：这个 block 的 FP16 scale。
+- `qs`：32 个量化后的 int8。
+- 反量化：`x[i] = fp16_to_float(d) * qs[i]`。
+- 全零 block 的 `d` 和 `qs` 都是 0。一行尾部不足 32 个元素时，剩余位置补 0，反量化只写回原始 shape 覆盖到的元素。
+
+`QuantizedTensor` 用 `QuantType` 标记当前格式。线性层可以保持 F32、Q8_0、Q4_0 或 Q4_1，Forward 按类型分发。GGUF loader 读到 Q8_0 时按 block 字节拷进 `q8_0_data`，不先把整份权重展开成 F32。
+
+`QuantizeToQ80()` 按行切 block。二维权重 `[out_features, in_features]` 的每一行单独切，block 不跨输出通道。每个 block 取绝对值最大的元素做 scale：`d = max_abs / 127`，再把 `d` 存成 FP16，用存回去的 `stored_d` 反算量化系数。全零 block 直接把 `d` 设为 0。
+
+`DequantizeFromQ80()` 按原始 shape 还原，并检查 block 数是否匹配。
+
+推理主链路走 `LinearQ80()`：点积里按元素反量化，不分配整份 F32 权重。输入可以是 `[in_features]`（单 token decode）或 `[batch, in_features]`（prefill）。ARM NEON 上一次处理 8 个 int8；其他平台走通用 C++ 循环。`MatmulQ80()` 会先整块还原成 F32 再做普通矩阵乘，用来看数值误差，推理不走这条路径。
+
+误差来自取整。单个元素的理想舍入大约不超过 `0.5 * scale`，再加上 FP16 scale 本身的舍入。测试用 `max_err < 6e-2` 看 roundtrip，矩阵乘累加后用更宽的 `2e-1`。
+
+`generate` 和 `bench` 都支持 `--quant q8_0`。`QuantizeModelToQ80()` 只转换线性权重，Embedding、RMSNorm 和 bias 仍是 F32，所以 tiny 模型的整体压缩比会低于 3.76x。
+
+```bash
+./build/mini-llama generate --model models/tiny --quant q8_0 -p hello -n 4
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --quant q8_0
+```
+
 ## 本章验证
 
-检查 benchmark 模块时，建议确认这些结果：
+检查 Q8_0 时，建议确认这些结果：
 
-- `bench models/tiny -p hello -n 4 --seed 42` 能输出 `Results`。
-- `generated tokens` 和 `Decode tokens` 的关系符合 `n_predict=4`、`Decode tokens=3`。
-- `--verbose` 能打印 logits top-k、KV cache shape 和 Decode step。
-- `--quant q8_0` 能打印 `weight memory` 和 `logits error vs model-native`。
-- `--threads` 能改变输出里的 `threads` 字段。
+- `q8_0_block_layout`：block size 是 32，`sizeof(BlockQ80)` 是 34。
+- `q8_0_roundtrip_identity`：量化再反量化，误差在阈值内。
+- `q8_0_all_zeros`：全零输入得到全零输出。
+- `matmul_q8_0_matches_f32` 和 `CompareMatmulError` 能通过。
+- `generate --quant q8_0` 输出 `quant: q8_0`。
+- `bench --quant q8_0` 能打印 `weight memory` 和 `logits error vs model-native`。
 
 建议运行：
 
 ```bash
 cmake --build build -j4
 ctest --test-dir build -R mini-llama-tests --output-on-failure
-./build/mini-llama bench models/tiny -p hello -n 4 --seed 42
-./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --verbose
+./build/mini-llama generate --model models/tiny --quant q8_0 -p hello -n 4
 ./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --quant q8_0
-./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --threads 4
 ```
 
 ## 目录结构
@@ -500,7 +530,8 @@ mini-llama/
     ├── test_loader.cc
     ├── test_gguf.cc
     ├── test_gguf_loader.cc
-    └── test_debug.cc
+    ├── test_debug.cc
+    └── test_quant.cc
 ```
 
 ## Forward 主链路

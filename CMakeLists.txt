@@ -61,6 +61,7 @@ set(TEST_SOURCES
   tests/test_gguf.cc
   tests/test_gguf_loader.cc
   tests/test_debug.cc
+  tests/test_quant.cc
 )
 
 add_executable(mini-llama-tests ${TEST_SOURCES})
