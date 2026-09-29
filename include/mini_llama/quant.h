@@ -35,4 +35,7 @@ Tensor MatmulQ80(const std::vector<BlockQ80>& weight, const Tensor& input,
 // Max absolute error between F32 Matmul and MatmulQ80.
 float CompareMatmulError(const Tensor& weight, const Tensor& input);
 
+// Max absolute error between F32 Linear and LinearQ40.
+float CompareQ40Error(const Tensor& weight, const Tensor& input);
+
 }  // namespace mini_llama

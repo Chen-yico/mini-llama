@@ -2,7 +2,7 @@
 
 从零实现的 LLaMA 风格 C++ 推理引擎，按课程步骤逐步搭建。
 
-当前进度：**Q8_0 量化** — 把线性层 F32 权重收成 34 字节 block，推理时按块反量化，避免把整份权重展开回 F32。
+当前进度：**Q4_0 量化** — 把线性层继续压到 18 字节 block，点积时按 nibble 解包，不把权重展开回 F32。
 
 前面几章已经把真实模型路径上的关键模块接起来了：
 
@@ -82,6 +82,7 @@ models/chat/
 ./build/mini-llama generate -p "hello mini llama" -n 8
 ./build/mini-llama generate -p "hello" -n 8 --temperature 0.8 --top-k 20 --seed 42
 ./build/mini-llama generate --model models/tiny --quant q8_0 -p hello -n 4
+./build/mini-llama generate --model models/tiny --quant q4_0 -p hello -n 4
 ./build/mini-llama inspect models/tiny
 ./build/mini-llama inspect-gguf models/tiny/test.gguf
 ./build/mini-llama inspect-gguf models/chat/Qwen2-0.5B-Instruct-Q8_0.gguf
@@ -90,6 +91,7 @@ models/chat/
 ./build/mini-llama bench models/tiny -p hello -n 4 --seed 42
 ./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --verbose
 ./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --quant q8_0
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --threads 1 --quant q4_0
 ./build/mini-llama bench models/chat -p hello -n 32 --seed 1 --threads 4
 ```
 
@@ -459,24 +461,52 @@ Q8_0 每 32 个浮点收成一个 block：1 个 FP16 scale（2 字节）加 32 �
 ./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --quant q8_0
 ```
 
+## Q4_0 量化
+
+Q8_0 已经把 32 个 F32 从 128 字节压到 34 字节。Q4_0 继续压缩：32 个权重只保留 32 个 4-bit 数值，再加 1 个 FP16 scale，一块 18 字节。单个 block 的理论压缩比是 `128 / 18 ≈ 7.11x`。
+
+`BlockQ40` 定义在 `include/mini_llama/quantized_tensor.h`，布局对齐 ggml / llama.cpp 的 `block_q4_0`：
+
+- `d`：这个 block 的 FP16 scale。
+- `qs`：16 个字节，每个字节存两个 4-bit 量化值。
+- 存储用无符号 nibble `0..15`，计算时减 8，还原成有符号范围 `-8..7`：`value = fp16_to_float(d) * (q - 8)`。
+
+半块交错打包：`qs[j]` 的低 4 位是元素 `j`，高 4 位是元素 `j + 16`。前 16 个元素放在所有字节的低 4 位，后 16 个元素放在高 4 位。解包时可以一次拿出一整段低 nibble 或高 nibble。
+
+`QuantizeToQ40()` 和 Q8_0 一样按行切 block，每个输出通道单独切。每个 block 先找绝对值上限，scale 用 `max_abs / 7`，因为 Q4_0 的最大正整数是 7。`d` 存成 FP16 后，用存回去的 `stored_d` 反算量化系数。打包时一次处理 `j` 和 `j + 16`，`+ 8` 是零点偏移，把近似 `[-8, 7]` 搬到 `[0, 15]`。
+
+`DequantizeFromQ40()` 把低 4 位还原成 `idx0`，高 4 位还原成 `idx1`。例如 `d = 1`、`qs[0] = 0xA3`：低 4 位是 3，减 8 得到元素 0 的 `-5`；高 4 位是 10，减 8 得到元素 16 的 `2`。
+
+推理主链路走 `LinearQ40()`。通用路径复用 `LinearQuantizedImpl()`，通过 `DequantQ40()` 取出某个 block 内的权重，点积时按需解包。ARM NEON 上一次解包 16 个 nibble，并对 16 个值做向量乘加；这条专用路径支持 `[in_features]` 或 `[1, in_features]`。其他平台走通用 C++ 路径，支持 `[in_features]` 或 `[batch, in_features]`。
+
+Q4_0 只有 16 个离散值，误差通常比 Q8_0 大。roundtrip 测试用 `max_err < 3e-1`，`LinearQ40` 对齐 F32 时用 `2.0`。`CompareQ40Error()` 先跑 F32 `Linear()`，再跑 `LinearQ40()`，返回两边输出的最大绝对误差。
+
+`generate` 和 `bench` 都支持 `--quant q4_0`。`QuantizeModelToQ40()` 只转换线性权重，Embedding、RMSNorm 和 bias 仍是 F32，所以 tiny 模型的整体压缩比低于 7.11x，`weight memory` 大约是 `3.94x`。tiny 太小，吞吐容易被计时抖动盖住；这里更适合看权重体积是否下降，以及 logits 相对 F32 的偏差。
+
+```bash
+./build/mini-llama generate --model models/tiny --quant q4_0 -p hello -n 4
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --threads 1 --quant q4_0
+```
+
 ## 本章验证
 
-检查 Q8_0 时，建议确认这些结果：
+检查 Q4_0 时，建议确认这些结果：
 
-- `q8_0_block_layout`：block size 是 32，`sizeof(BlockQ80)` 是 34。
-- `q8_0_roundtrip_identity`：量化再反量化，误差在阈值内。
-- `q8_0_all_zeros`：全零输入得到全零输出。
-- `matmul_q8_0_matches_f32` 和 `CompareMatmulError` 能通过。
-- `generate --quant q8_0` 输出 `quant: q8_0`。
-- `bench --quant q8_0` 能打印 `weight memory` 和 `logits error vs model-native`。
+- `q4_0_block_layout`：block size 是 32，`sizeof(BlockQ40)` 是 18。
+- `q4_0_roundtrip_identity`：量化再反量化，误差在阈值内。
+- `q4_0_all_zeros`：全零输入得到全零输出。
+- `q4_0_linear_matches_f32`：`LinearQ40()` 和 F32 `Linear()` 结果接近。
+- `CompareQ40Error`：误差计算函数可用。
+- `generate --quant q4_0` 输出 `quant: q4_0`。
+- `bench --quant q4_0` 能打印下降后的 `weight memory` 和 `logits error vs model-native`。
 
 建议运行：
 
 ```bash
 cmake --build build -j4
 ctest --test-dir build -R mini-llama-tests --output-on-failure
-./build/mini-llama generate --model models/tiny --quant q8_0 -p hello -n 4
-./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --quant q8_0
+./build/mini-llama generate --model models/tiny --quant q4_0 -p hello -n 4
+./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --threads 1 --quant q4_0
 ```
 
 ## 目录结构
