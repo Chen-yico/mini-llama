@@ -2,7 +2,7 @@
 
 从零实现的 LLaMA 风格 C++ 推理引擎，按课程步骤逐步搭建。
 
-当前进度：**Q4_0 量化** — 把线性层继续压到 18 字节 block，点积时按 nibble 解包，不把权重展开回 F32。
+当前进度：**Matmul Dispatch** — 上层只调用 `Linear()`，算子层按权重格式、线程数和内存是否连续选择执行路径。
 
 前面几章已经把真实模型路径上的关键模块接起来了：
 
@@ -488,7 +488,62 @@ Q4_0 只有 16 个离散值，误差通常比 Q8_0 大。roundtrip 测试用 `ma
 ./build/mini-llama bench models/tiny -p hello -n 4 --seed 42 --threads 1 --quant q4_0
 ```
 
+## Matmul Dispatch 设计
+
+量化把权重存成了 Q8_0、Q4_0。到了推理主链路，线性层调用仍然保持简单：上层只关心 `Linear(x, weight)`，底层根据数据类型、线程数和 CPU 指令集选择执行路径。
+
+公开接口在 `include/mini_llama/ops.h`：
+
+- `Matmul(a, b)`：通用矩阵乘 `[M, K] x [K, N] -> [M, N]`。
+- `Linear(x, weight)`：F32 权重，`x @ weight^T`。
+- `Linear(x, QuantizedTensor)`：按 `QuantType` 分到 `LinearQ80()` / `LinearQ40()` / `LinearQ41()`。F32 再转回上面的 Tensor 路径。
+
+`src/forward.cc` 里的 attention projection、FFN 和 `lm_head` 都经过 `ForwardLinear()`。线性权重在这个项目里已经是 `QuantizedTensor`，所以这一层直接把权重交给对应的 `Linear()` 重载：F32 走 F32 分发器，量化权重在点积里按需反量化。
+
+`include/mini_llama/matmul_dispatch.h` 定义四种模式：`kNaive`、`kThreaded`、`kSimd`、`kThreadedSimd`。公开的 `Matmul()` 和 F32 `Linear()` 使用 `DefaultMatmulMode()`，当前默认是 `kThreadedSimd`。这个名字表示优先使用多线程和 SIMD，实际路径还要看内存访问：
+
+- `Linear()` 的输入和权重每一行都连续，可以走 SIMD 点积。`kThreadedSimd` 按 `out_features` 把输出通道切给不同线程，每个线程内部再用 `DotSimd()`。外层是任务级并行，内层是指令级并行。
+- 通用 `Matmul()` 的右矩阵是 row-major。计算 `c[i, j]` 时要读 `b[0, j]`、`b[1, j]`……这些元素在内存里间隔 `N`，连续加载条件差。所以 `kSimd` 和 `kThreadedSimd` 目前都回到 `MatmulThreaded()`。
+
+`MatmulNaive()` / `LinearNaive()` 是普通三重循环，给优化路径当尺子。`ParallelFor(n, fn)` 把 `[0, n)` 切成若干 `[begin, end)`，每个线程写自己的输出位置，不需要额外加锁。worker 里的异常会捕获后在主线程重新抛出。任务量小于 `线程数 * 16` 时直接在当前线程执行，避免小矩阵的调度开销。
+
+`DotSimd()` 在编译器定义了 AVX2 + FMA 时走 AVX2，ARM NEON 平台走 NEON，否则回到标量循环。MSVC 默认不定义 `__AVX2__`，这条路径在当前 Windows 构建里是标量回退；数值仍与 naive 对齐。
+
+`generate` 和 `bench` 都支持 `--threads <n>`。`SetThreadCount(0)` 表示使用 `hardware_concurrency()`，读不到时回退到 4。`--dump-logits <dir>` 把逐步 logits 写成二进制，用来确认不同线程数的输出一致。
+
+```bash
+./build/mini-llama bench models/tiny \
+  --tokenizer models/tiny/vocab.json \
+  --prompt hello \
+  --n-predict 4 \
+  --threads 4 \
+  --verbose
+```
+
+输出里应包含 `threads: 4`、`[verbose] prefill` 和 `tokens/s (total):`。tiny 模型很小，线程数对吞吐的影响不稳定；这里先确认参数进了执行路径，以及优化结果和参考路径接近。
+
 ## 本章验证
+
+检查 Matmul Dispatch 时，建议确认这些结果：
+
+- `matmul_naive_vs_threaded`：通用 matmul 的 naive 和 threaded 输出一致。
+- `linear_all_modes_match`：F32 linear 四种模式输出一致。
+- `linear_2d_input_all_modes_match`：`[1, in_features]` 输入 shape 保持一致。
+- `different_thread_counts_same_output`：线程数为 1、2、4 时输出一致。
+- `thread_count_api`：`SetThreadCount()` 和 `GetThreadCount()` 行为正确。
+- `parallel_for_propagates_exception`：worker 线程异常能回到主线程。
+- `generate --threads 1` 和 `generate --threads 4` 导出的 logits 文件一致。
+- `bench --threads 4 --verbose` 会报告线程数和吞吐指标。
+
+建议运行：
+
+```bash
+cmake --build build -j4
+ctest --test-dir build -R "mini-llama-tests|threaded-cli-smoke" --output-on-failure
+python3 scripts/test_threaded_cli.py
+```
+
+## Q4_0 本章验证
 
 检查 Q4_0 时，建议确认这些结果：
 
@@ -545,7 +600,8 @@ mini-llama/
 │   ├── download_demo_model.py
 │   ├── export_gguf_tokenizer.py
 │   ├── make_test_gguf.py
-│   └── test_real_model_smoke.py
+│   ├── test_real_model_smoke.py
+│   └── test_threaded_cli.py
 ├── src/                    对应实现
 └── tests/
     ├── test_tensor.cc / test_ops.cc
@@ -624,7 +680,7 @@ GQA：`kv_head = q_head / (n_heads / n_kv_heads)`。Attention 点积后除以 `s
 
 | 算子 | 说明 |
 |------|------|
-| `Matmul` / `Linear` | 矩阵乘与全连接（含 naive/threaded/SIMD 分发） |
+| `Matmul` / `Linear` | 矩阵乘与全连接。F32 按 naive / threaded / SIMD 分发；量化权重按 `QuantType` 分发 |
 | `RmsNorm` | RMS 归一化 |
 | `Softmax` | 数值稳定 softmax（先减 max） |
 | `Silu` / `SwiGlu` | 激活函数 |

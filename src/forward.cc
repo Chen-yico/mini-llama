@@ -125,10 +125,17 @@ Tensor AddOptionalBias(const Tensor& x, const Tensor& bias,
   return y;
 }
 
+// Attention projections, FFN and lm_head all enter here. The weight is already
+// a QuantizedTensor: F32 goes through LinearDispatch, Q8_0 / Q4_0 / Q4_1 go
+// through the matching kernel and dequantize inside the dot product.
+Tensor ForwardLinear(const Tensor& x, const QuantizedTensor& weight) {
+  return Linear(x, weight);
+}
+
 Tensor FfnForward(const Tensor& h, const LayerWeights& layer) {
-  const Tensor gate = Linear(h, layer.w_gate);
-  const Tensor up = Linear(h, layer.w_up);
-  return Linear(SwiGlu(gate, up), layer.w_down);
+  const Tensor gate = ForwardLinear(h, layer.w_gate);
+  const Tensor up = ForwardLinear(h, layer.w_up);
+  return ForwardLinear(SwiGlu(gate, up), layer.w_down);
 }
 
 Tensor ForwardLayer(MiniLlamaContext& ctx, const MiniLlamaModel& model,
@@ -141,12 +148,12 @@ Tensor ForwardLayer(MiniLlamaContext& ctx, const MiniLlamaModel& model,
   const int pos = ctx.pos;
 
   Tensor h = RmsNorm(x, weights.attention_norm, config.rms_norm_eps);
-  Tensor q_flat =
-      AddOptionalBias(Linear(h, weights.wq), weights.bq, "forward_layer q");
-  Tensor k_flat =
-      AddOptionalBias(Linear(h, weights.wk), weights.bk, "forward_layer k");
-  Tensor v_flat =
-      AddOptionalBias(Linear(h, weights.wv), weights.bv, "forward_layer v");
+  Tensor q_flat = AddOptionalBias(ForwardLinear(h, weights.wq), weights.bq,
+                                  "forward_layer q");
+  Tensor k_flat = AddOptionalBias(ForwardLinear(h, weights.wk), weights.bk,
+                                  "forward_layer k");
+  Tensor v_flat = AddOptionalBias(ForwardLinear(h, weights.wv), weights.bv,
+                                  "forward_layer v");
 
   Tensor q = q_flat.ReshapeChecked({n_heads, head_dim}, "forward_layer q");
   Tensor k = k_flat.ReshapeChecked({n_kv_heads, head_dim}, "forward_layer k");
@@ -158,7 +165,7 @@ Tensor ForwardLayer(MiniLlamaContext& ctx, const MiniLlamaModel& model,
                                      n_kv_heads, head_dim);
   Tensor attn_out_flat = attn_out.ReshapeChecked({n_heads * head_dim},
                                                  "forward_layer attn_out");
-  Tensor attn_proj = Linear(attn_out_flat, weights.wo);
+  Tensor attn_proj = ForwardLinear(attn_out_flat, weights.wo);
   RequireShape(attn_proj, {dim}, "forward_layer attn_proj");
 
   Tensor x_attn = ForwardAdd(x, attn_proj);
@@ -172,7 +179,7 @@ Tensor ForwardLayer(MiniLlamaContext& ctx, const MiniLlamaModel& model,
 Tensor ComputeLogits(const Tensor& x, const MiniLlamaModel& model,
                      const ModelConfig& config) {
   const Tensor normed = RmsNorm(x, model.final_norm, config.rms_norm_eps);
-  const Tensor logits_flat = Linear(normed, model.lm_head);
+  const Tensor logits_flat = ForwardLinear(normed, model.lm_head);
   return logits_flat.ReshapeChecked({config.vocab_size}, "compute_logits");
 }
 
