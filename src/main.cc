@@ -40,7 +40,7 @@ void PrintUsage(const char* program) {
       << "  " << program
       << " generate [--model path|dir] [--tokenizer vocab.json] [-p prompt] "
          "[-n tokens] [--temperature T] [--top-k k] [--seed S] [--threads N] "
-         "[--quant q8_0|q4_0]\n"
+         "[--quant q8_0|q4_0] [--dump-logits dir]\n"
       << "  " << program << " inspect <model-path|dir>\n"
       << "  " << program << " inspect-gguf <path>\n"
       << "  " << program
@@ -366,6 +366,55 @@ void PrintIntList(const char* label, const std::vector<int>& values) {
   std::cout << "]\n";
 }
 
+void DumpLogits(const mini_llama::Tensor& logits, const std::string& path) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out.is_open()) {
+    throw std::runtime_error("failed to open logits dump file: " + path);
+  }
+  out.write(reinterpret_cast<const char*>(logits.data.data()),
+            static_cast<std::streamsize>(logits.data.size() * sizeof(float)));
+  if (!out.good()) {
+    throw std::runtime_error("failed to write logits to: " + path);
+  }
+}
+
+void EnsureDumpDirectory(const std::string& path) {
+  std::error_code error;
+  std::filesystem::create_directories(path, error);
+  if (error) {
+    throw std::runtime_error("failed to create logits dump directory: " + path +
+                             ": " + error.message());
+  }
+  if (!std::filesystem::is_directory(path)) {
+    throw std::runtime_error("logits dump path is not a directory: " + path);
+  }
+}
+
+void DumpGeneratedTokens(const std::vector<int>& generated,
+                         const std::string& path) {
+  std::ofstream out(path);
+  if (!out.is_open()) {
+    throw std::runtime_error("failed to open generation token dump file: " +
+                             path);
+  }
+  for (size_t i = 0; i < generated.size(); ++i) {
+    if (i > 0) {
+      out << " ";
+    }
+    out << generated[i];
+  }
+  out << "\n";
+  if (!out.good()) {
+    throw std::runtime_error("failed to write generation tokens to: " + path);
+  }
+}
+
+std::string DumpStepPath(const std::string& dir, int step) {
+  return (std::filesystem::path(dir) /
+          ("logits_step" + std::to_string(step) + ".bin"))
+      .string();
+}
+
 int FailRequest(mini_llama::RequestContext& request, const std::string& message) {
   request.SetError(message);
   request.Finish();
@@ -382,6 +431,7 @@ int RunGenerate(int argc, char** argv) {
   std::string model_path = "models/tiny";
   std::string explicit_tokenizer_path;
   std::string quant_type;
+  std::string dump_logits_dir;
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
@@ -454,6 +504,12 @@ int RunGenerate(int argc, char** argv) {
         return 1;
       }
       quant_type = argv[++i];
+    } else if (arg == "--dump-logits") {
+      if (i + 1 >= argc) {
+        std::cerr << "missing value for " << arg << "\n";
+        return 1;
+      }
+      dump_logits_dir = argv[++i];
     } else if (arg == "-h" || arg == "--help") {
       PrintUsage(argv[0]);
       return 0;
@@ -467,6 +523,15 @@ int RunGenerate(int argc, char** argv) {
     std::cerr << "Invalid --quant value: " << quant_type
               << ". Supported values: q8_0, q4_0.\n";
     return 1;
+  }
+
+  if (!dump_logits_dir.empty()) {
+    try {
+      EnsureDumpDirectory(dump_logits_dir);
+    } catch (const std::exception& e) {
+      std::cerr << "Logits dump setup failed: " << e.what() << "\n";
+      return 1;
+    }
   }
 
   PrintCpuBanner();
@@ -575,13 +640,27 @@ int RunGenerate(int argc, char** argv) {
   try {
     std::cout << "prefill...\n";
     stage_start = mini_llama::RequestClock::now();
-    mini_llama::Tensor logits = mini_llama::ForwardBatch(
-        ctx, model, mini_llama::MiniBatch::FromTokens(tokens, 0));
+    mini_llama::Tensor logits;
+    int dump_step = 0;
+    if (!dump_logits_dir.empty()) {
+      for (size_t i = 0; i < tokens.size(); ++i) {
+        logits = mini_llama::ForwardBatch(
+            ctx, model,
+            mini_llama::MiniBatch::FromTokens({tokens[i]},
+                                              static_cast<int>(i)));
+        ++ctx.n_prefill_tokens;
+        DumpLogits(logits, DumpStepPath(dump_logits_dir, dump_step));
+        ++dump_step;
+      }
+    } else {
+      logits = mini_llama::ForwardBatch(
+          ctx, model, mini_llama::MiniBatch::FromTokens(tokens, 0));
+      ctx.n_prefill_tokens += static_cast<int>(tokens.size());
+    }
     request.prefill_ms = mini_llama::ElapsedMs(stage_start);
     request.prefill_tokens = static_cast<int>(tokens.size());
-    ctx.n_prefill_tokens += request.prefill_tokens;
     request.RecordEvent("prefill", request.prefill_ms, request.prefill_tokens,
-                        "batch");
+                        dump_logits_dir.empty() ? "batch" : "step_dump");
 
     std::cout << "decode loop...\n";
     generated.reserve(static_cast<size_t>(n_predict));
@@ -603,9 +682,24 @@ int RunGenerate(int argc, char** argv) {
       ++ctx.n_decode_tokens;
       request.RecordEvent("decode", decode_ms, 1,
                           "pos=" + std::to_string(ctx.pos));
+      if (!dump_logits_dir.empty()) {
+        DumpLogits(logits, DumpStepPath(dump_logits_dir, dump_step));
+        ++dump_step;
+      }
     }
   } catch (const std::exception& e) {
     return FailRequest(request, "Inference failed: " + std::string(e.what()));
+  }
+
+  if (!dump_logits_dir.empty()) {
+    try {
+      DumpGeneratedTokens(
+          generated,
+          (std::filesystem::path(dump_logits_dir) / "generation_tokens.txt")
+              .string());
+    } catch (const std::exception& e) {
+      return FailRequest(request, "Logits dump failed: " + std::string(e.what()));
+    }
   }
 
   request.generated_tokens = static_cast<int>(generated.size());

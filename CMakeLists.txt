@@ -62,6 +62,7 @@ set(TEST_SOURCES
   tests/test_gguf_loader.cc
   tests/test_debug.cc
   tests/test_quant.cc
+  tests/test_threaded_matmul.cc
 )
 
 add_executable(mini-llama-tests ${TEST_SOURCES})
@@ -80,6 +81,14 @@ if(Python3_Interpreter_FOUND)
             MINI_LLAMA_SKIP_REAL_MODEL=1
             ${Python3_EXECUTABLE}
             ${CMAKE_SOURCE_DIR}/scripts/test_real_model_smoke.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  )
+  add_test(
+    NAME threaded-cli-smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+            MINI_LLAMA_BIN=$<TARGET_FILE:mini-llama>
+            ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/scripts/test_threaded_cli.py
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   )
 endif()
