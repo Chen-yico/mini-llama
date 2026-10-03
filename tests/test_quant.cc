@@ -164,6 +164,85 @@ static bool TestDequantizeRejectsBlockCountMismatch() {
   return true;
 }
 
+static bool TestQ40BlockLayout() {
+  MINI_LLAMA_ASSERT_EQ(kQ40BlockSize, 32);
+  MINI_LLAMA_ASSERT_EQ(sizeof(BlockQ40), 18);
+  return true;
+}
+
+static bool TestQ40RoundtripIdentity() {
+  Tensor src({32}, 0.0f);
+  for (int i = 0; i < 32; ++i) {
+    src.data[i] = static_cast<float>(i) * 0.1f;
+  }
+
+  auto blocks = QuantizeToQ40(src);
+  MINI_LLAMA_ASSERT_EQ(blocks.size(), 1);
+
+  Tensor dst = DequantizeFromQ40(blocks, src.shape);
+  MINI_LLAMA_ASSERT_EQ(dst.shape[0], 32);
+
+  float max_err = 0.0f;
+  for (size_t i = 0; i < src.size(); ++i) {
+    float err = std::abs(src.data[i] - dst.data[i]);
+    if (err > max_err) {
+      max_err = err;
+    }
+  }
+  MINI_LLAMA_ASSERT_TRUE(max_err < 3e-1f);
+  return true;
+}
+
+static bool TestQ40AllZeros() {
+  Tensor src({64}, 0.0f);
+  auto blocks = QuantizeToQ40(src);
+  MINI_LLAMA_ASSERT_EQ(blocks.size(), 2);
+
+  Tensor dst = DequantizeFromQ40(blocks, src.shape);
+  for (size_t i = 0; i < dst.size(); ++i) {
+    MINI_LLAMA_ASSERT_NEAR(dst.data[i], 0.0f, 1e-6f);
+  }
+  return true;
+}
+
+static bool TestQ40LinearMatchesF32() {
+  Tensor weight({4, 32}, 0.0f);
+  for (size_t i = 0; i < weight.size(); ++i) {
+    weight.data[i] = static_cast<float>(i) * 0.05f - 1.0f;
+  }
+
+  Tensor x({32}, 0.0f);
+  for (size_t i = 0; i < x.size(); ++i) {
+    x.data[i] = static_cast<float>(i) * 0.1f - 0.4f;
+  }
+
+  auto qW = QuantizeToQ40(weight);
+  Tensor y_f32 = Linear(x, weight);
+  Tensor y_q4 = LinearQ40(x, qW, weight.shape);
+
+  MINI_LLAMA_ASSERT_EQ(y_f32.shape, y_q4.shape);
+  for (size_t i = 0; i < y_f32.size(); ++i) {
+    MINI_LLAMA_ASSERT_NEAR(y_f32.data[i], y_q4.data[i], 2.0f);
+  }
+  return true;
+}
+
+static bool TestCompareQ40Error() {
+  Tensor weight({8, 32}, 0.0f);
+  Tensor x({32}, 0.0f);
+  for (size_t i = 0; i < weight.size(); ++i) {
+    weight.data[i] = static_cast<float>(i) * 0.01f - 1.0f;
+  }
+  for (size_t i = 0; i < x.size(); ++i) {
+    x.data[i] = static_cast<float>(i) * 0.01f - 0.5f;
+  }
+
+  float err = CompareQ40Error(weight, x);
+  MINI_LLAMA_ASSERT_TRUE(err >= 0.0f);
+  MINI_LLAMA_ASSERT_TRUE(err < 2.0f);
+  return true;
+}
+
 static struct QuantTestRegistrar {
   QuantTestRegistrar() {
     RegisterTest("q8_0_block_layout", TestQ80BlockLayout);
@@ -176,5 +255,10 @@ static struct QuantTestRegistrar {
     RegisterTest("dequantize_rejects_bad_shape", TestDequantizeRejectsBadShape);
     RegisterTest("dequantize_rejects_block_count_mismatch",
                  TestDequantizeRejectsBlockCountMismatch);
+    RegisterTest("q4_0_block_layout", TestQ40BlockLayout);
+    RegisterTest("q4_0_roundtrip_identity", TestQ40RoundtripIdentity);
+    RegisterTest("q4_0_all_zeros", TestQ40AllZeros);
+    RegisterTest("q4_0_linear_matches_f32", TestQ40LinearMatchesF32);
+    RegisterTest("CompareQ40Error", TestCompareQ40Error);
   }
 } quant_test_registrar;
