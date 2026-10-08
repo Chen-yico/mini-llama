@@ -2,7 +2,7 @@
 
 从零实现的 LLaMA 风格 C++ 推理引擎，按课程步骤逐步搭建。
 
-当前进度：**Matmul Dispatch** — 上层只调用 `Linear()`，算子层按权重格式、线程数和内存是否连续选择执行路径。
+当前进度：**Thread Pool 与多线程 Matmul** — 按输出行切任务，每次 `ParallelFor()` 创建线程再 `join`，输入只读、输出分段写，不加锁。
 
 前面几章已经把真实模型路径上的关键模块接起来了：
 
@@ -522,7 +522,7 @@ Q4_0 只有 16 个离散值，误差通常比 Q8_0 大。roundtrip 测试用 `ma
 
 输出里应包含 `threads: 4`、`[verbose] prefill` 和 `tokens/s (total):`。tiny 模型很小，线程数对吞吐的影响不稳定；这里先确认参数进了执行路径，以及优化结果和参考路径接近。
 
-## 本章验证
+## Matmul Dispatch 本章验证
 
 检查 Matmul Dispatch 时，建议确认这些结果：
 
@@ -541,6 +541,70 @@ Q4_0 只有 16 个离散值，误差通常比 Q8_0 大。roundtrip 测试用 `ma
 cmake --build build -j4
 ctest --test-dir build -R "mini-llama-tests|threaded-cli-smoke" --output-on-failure
 python3 scripts/test_threaded_cli.py
+```
+
+## Thread Pool 与多线程 Matmul
+
+CPU 推理的主要耗时在线性层。一次 `Linear(x, W)` 是输入向量乘一整张权重矩阵。输出的每个元素都是权重的一行和输入做点积，不同输出行互不依赖。适合 CPU 并行的任务要满足三件事：单个任务有足够计算量，切分后尽量少同步，不同线程写回的位置也清楚。线性层正好是这个形状。
+
+本仓库不维护常驻 worker 队列。`ParallelFor()` 每次调用时把 `[0, n)` 拆成连续区间，创建若干 `std::thread`，全部 `join()` 后再返回。常驻线程池能少付创建开销，但会带上任务队列、唤醒和生命周期管理。当前阶段先把「按区间切任务」写清楚，供 `Linear`、`Matmul` 和 Attention 复用。
+
+```cpp
+void ParallelFor(int n, const std::function<void(int begin, int end)>& fn);
+```
+
+调用方只提供总任务数和一段 `[begin, end)` 的处理函数。余数分给前面的线程，所以各段长度尽量接近。例如 `n = 10`、线程数 `3` 时，区间是 `[0, 4)`、`[4, 7)`、`[7, 10)`。
+
+线程数来自 `GetThreadCount()`。`g_thread_count == 0` 时使用 `std::thread::hardware_concurrency()`，读不到则回退到 4。`generate` 和 `bench` 的 `--threads` 会调用 `SetThreadCount()`：`0` 恢复自动，大于 `0` 使用指定值。benchmark 会把这个数打印出来，后面比较吞吐时才知道条件相同。
+
+任务太小时不创建线程。每个线程至少要分到 `kMinChunk = 16` 个任务，否则直接在当前线程执行 `fn(0, n)`。例如 `n = 10`、线程数 `8`，每个线程只有一两个任务，创建和 `join` 的开销会盖过计算。线程数也会被限制在 `n` 以内，避免线程比任务多。
+
+worker 里的异常先存进 `std::exception_ptr`，所有线程 `join()` 之后再在主线程抛出。异常如果直接逃出线程入口，程序会调用 `std::terminate()`。
+
+`LinearThreaded()` 按 `out_features` 切。输入 `x` 和权重只读，可以被多个线程共享；每个线程写入不同的 `result[j]`，所以不需要锁。`different_thread_counts_same_output` 测的就是线程数变化后结果仍一致。`LinearThreadedSimd()` 用同一套切分，每个输出通道内部再做 SIMD 点积。
+
+通用 `MatmulThreaded()` 按输出矩阵的行切，也就是 `M` 维。每个线程负责若干行，`c[i, j]` 只由对应线程写一次。通用矩阵乘的 SIMD 模式仍回到这条路径，因为右矩阵按列访问，内存不连续。
+
+`src/forward.cc` 里的 CPU Attention 按 head 切：`ParallelFor(n_heads, ...)`，每个 head 写自己的 `attn_out[h, :]`。本仓库是 CPU 路径，这条切分只服务 CPU Attention。
+
+`ParallelFor()` 适合粗粒度循环，例如 `out_features` 和 `n_heads`。放进很细的内层循环时，调度成本会吃掉收益。
+
+和 llama.cpp 的对应关系是：`llama_context::set_n_threads`、`ggml_backend_cpu_set_n_threads`、`ggml_backend_cpu_set_threadpool` 和 `ggml_graph_compute` 把线程数交给 CPU 计算图。llama.cpp 还包含 batch 线程数、后端 threadpool、计算图规划和工作区复用。mini 版只保留同一条主线：把可独立计算的区间切开，并行执行，再把结果汇合。
+
+```bash
+./build/mini-llama bench models/tiny \
+  --tokenizer models/tiny/vocab.json \
+  --prompt hello \
+  --n-predict 4 \
+  --threads 4 \
+  --verbose
+```
+
+tiny 模型太小，线程数从 1 扫到 8 不一定让 `tokens/s (Decode)` 稳定上升。这里先看两个确定信号：输出里的线程数，以及不同线程数导出的 logits 是否一致。
+
+## 本章验证
+
+检查 Thread Pool 时，建议确认这些结果：
+
+- `mini-llama-tests` 通过，其中包括 `matmul_naive_vs_threaded`、`different_thread_counts_same_output`、`thread_count_api`、`parallel_for_propagates_exception`。
+- `scripts/test_threaded_cli.py` 输出两个 `PASS`。
+- benchmark 输出包含 `threads: 4`。
+- verbose 输出包含 `[verbose] prefill`。
+- benchmark 输出包含 `tokens/s (total)` 和 `tokens/s (Decode)`。
+- `LinearThreaded()` 不需要锁：输入和权重只读，每个线程只写自己的输出区间。
+
+建议运行：
+
+```bash
+cmake --build build -j4
+ctest --test-dir build -R "mini-llama-tests|threaded-cli-smoke" --output-on-failure
+python3 scripts/test_threaded_cli.py
+./build/mini-llama bench models/tiny \
+  --tokenizer models/tiny/vocab.json \
+  --prompt hello \
+  --n-predict 4 \
+  --threads 4 \
+  --verbose
 ```
 
 ## Q4_0 本章验证

@@ -74,6 +74,7 @@ def test_bench_reports_thread_count(binary):
     assert "threads: 4" in result.stdout
     assert "[verbose] prefill" in result.stdout
     assert "tokens/s (total):" in result.stdout
+    assert "tokens/s (Decode):" in result.stdout
 
 
 def main():
