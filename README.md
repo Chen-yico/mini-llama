@@ -2,7 +2,7 @@
 
 从零实现的 LLaMA 风格 C++ 推理引擎，按课程步骤逐步搭建。
 
-当前进度：**Thread Pool 与多线程 Matmul** — 按输出行切任务，每次 `ParallelFor()` 创建线程再 `join`，输入只读、输出分段写，不加锁。
+当前进度：**SIMD 优化入门** — 多线程按输出通道切任务，单个线程里用一条指令同时做多组乘加。Linear 的输入和权重行连续，所以走 SIMD；通用 Matmul 的右矩阵按列读，仍回到多线程。
 
 前面几章已经把真实模型路径上的关键模块接起来了：
 
@@ -582,7 +582,7 @@ worker 里的异常先存进 `std::exception_ptr`，所有线程 `join()` 之后
 
 tiny 模型太小，线程数从 1 扫到 8 不一定让 `tokens/s (Decode)` 稳定上升。这里先看两个确定信号：输出里的线程数，以及不同线程数导出的 logits 是否一致。
 
-## 本章验证
+## Thread Pool 本章验证
 
 检查 Thread Pool 时，建议确认这些结果：
 
@@ -599,6 +599,59 @@ tiny 模型太小，线程数从 1 扫到 8 不一定让 `tokens/s (Decode)` 稳
 cmake --build build -j4
 ctest --test-dir build -R "mini-llama-tests|threaded-cli-smoke" --output-on-failure
 python3 scripts/test_threaded_cli.py
+./build/mini-llama bench models/tiny \
+  --tokenizer models/tiny/vocab.json \
+  --prompt hello \
+  --n-predict 4 \
+  --threads 4 \
+  --verbose
+```
+
+## SIMD 优化入门
+
+上一章把不同输出切给不同线程。这一章更细一层：单个线程算一个点积时，一条指令能不能一次处理多个数。多线程解决任务怎么分给多个核，SIMD 解决一个核里一条指令怎么处理更多数据。
+
+SIMD 是 Single Instruction, Multiple Data。标量循环一次只做 `sum += a[i] * b[i]`。向量指令把多个元素放进寄存器，一条指令同时做多组乘加。ARM NEON 是 128-bit，一次 4 个 float。x86 AVX2 是 256-bit，一次 8 个 float。
+
+本项目里 SIMD 主要服务 `Linear(x, W)`。输出的每个元素都是输入向量和权重的一行做点积。`x` 连续，`W` 的每一行也连续，CPU 可以把一小段一次装进向量寄存器。数据如果散落在内存各处，指令再强也很难发挥。
+
+对应代码：
+
+- `src/matmul_optimized.cc`：F32 的 `DotSimd()`、`LinearSimd()`、`LinearThreadedSimd()`。
+- `src/quant.cc`：Q8_0 / Q4_0 的 NEON 专用 `LinearQ80()`、`LinearQ40()`。
+- `tests/test_threaded_matmul.cc`：四种 F32 模式的输出是否一致。
+- `tests/test_quant.cc`：量化 Linear 和 F32 的误差是否落在阈值内。
+
+`DotSimd()` 在编译期分发，不在运行时探测。编译器同时定义了 `__AVX2__` 和 `__FMA__` 就编进 AVX2；定义了 `__ARM_NEON` 就编进 NEON；两个都没有就留下标量循环。CMake 没有主动加 `-mavx2 -mfma`。Apple Silicon 通常会自己打开 NEON。x86 机器即使硬件支持 AVX2，编译参数没打开时仍然走标量循环。这也是不同机器上 benchmark 差很多的原因之一。MSVC 默认不定义 `__AVX2__`，当前 Windows 构建里的 `DotSimd()` 是标量回退，外层多线程仍然生效。
+
+两条向量路径的形状一样：先按寄存器宽度累加，再把寄存器里的多个 lane 横向加成一个 float，最后用普通循环处理不能整除的尾部。NEON 一次 4 个，尾部最多剩 3 个；AVX2 一次 8 个，尾部最多剩 7 个。模型维度经常是 32、64、128，但底层函数仍要能处理任意长度。AVX2 用 `_mm256_loadu_ps` 做非对齐加载，不要求每行首地址按 32 字节对齐。
+
+`LinearSimd()` 对每个输出通道调用一次 `DotSimd()`。`LinearThreadedSimd()` 再用 `ParallelFor` 把输出通道切给多个线程，每个线程内部继续做 SIMD 点积。F32 `Linear()` 的默认模式是 `kThreadedSimd`，也就是多线程加 SIMD 点积。编译环境没有 NEON 或 AVX2 时，`DotSimd()` 内部是标量循环，外层多线程还在。
+
+通用 `Matmul(a, b)` 的 `kSimd` 和 `kThreadedSimd` 都回到 `MatmulThreaded()`。右矩阵按列读，相邻元素隔着一整行，不适合直接向量加载。要把通用矩阵乘做成高性能 SIMD，还要转置、分块和照顾 cache。当前把 SIMD 放在收益明确、代码也短的 Linear 点积上。
+
+量化 Linear 也有 SIMD 分支，但只写了 NEON。Q8_0 一次加载 8 个 int8，扩展到 int32，转成 float，乘 scale，再和输入乘加。Q4_0 先拆 16 个 nibble，减 8，再转成 float 做乘加。非 NEON 平台走通用的 `LinearQuantizedImpl()`，边读 block 边反量化。量化路径没有 AVX2 专用实现。量化 SIMD 比 F32 点积更绕，因为它要先把压缩格式还原成能参与计算的数，而不是先把整张权重展开成 F32。
+
+SIMD 和量化的测试目标不同。SIMD 是同一批 F32 数据换一种执行方式，`linear_all_modes_match` 要求 naive、threaded、simd、threaded-simd 的误差小于 `1e-5`。量化改变了权重表示，`q8_0_roundtrip_identity`、`q4_0_roundtrip_identity`、`q4_0_linear_matches_f32` 和 `CompareQ40Error` 只要求误差落在阈值内。两类测试分开，才能判断偏差来自执行路径还是量化本身。
+
+release 没有 CLI 参数直接切换 Naive、Simd、ThreadedSimd。用户侧用 `--threads`、`--quant` 和 `bench` 看端到端吞吐。tiny 模型很小，4 线程的 total tokens/s 可能更高，Decode tokens/s 可能更低。一次 benchmark 混进了分词、Prefill、Decode、线程调度和系统负载，不能把它当成 SIMD 单独带来的加速。
+
+## 本章验证
+
+检查 SIMD 时，建议确认这些结果：
+
+- `mini-llama-tests` 通过。
+- `linear_all_modes_match` 覆盖 naive、threaded、simd、threaded-simd，输出接近。
+- benchmark 输出包含 `threads: 4`。
+- benchmark 输出包含 `tokens/s (total)` 和 `tokens/s (Decode)`。
+- 能说明 NEON、AVX2、标量 fallback 三条路径的启用条件。
+- 能解释 `Linear()` 适合 SIMD、通用 `Matmul()` 当前回到 threaded 的原因。
+
+建议运行：
+
+```bash
+cmake --build build -j4
+ctest --test-dir build -R mini-llama-tests --output-on-failure
 ./build/mini-llama bench models/tiny \
   --tokenizer models/tiny/vocab.json \
   --prompt hello \
