@@ -1,5 +1,6 @@
 build/
 build-*/
 compile_commands.json
+artifacts/
 Qwen2-0.5B-Instruct-Q8_0.gguf
 models/chat/*.gguf
