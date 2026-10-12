@@ -2,7 +2,7 @@
 
 从零实现的 LLaMA 风格 C++ 推理引擎，按课程步骤逐步搭建。
 
-当前进度：**SIMD 优化入门** — 多线程按输出通道切任务，单个线程里用一条指令同时做多组乘加。Linear 的输入和权重行连续，所以走 SIMD；通用 Matmul 的右矩阵按列读，仍回到多线程。
+当前进度：**Python 参考对齐** — 用 NumPy 把同一个 tiny 模型、同一段 greedy 生成再跑一遍，逐步比较 logits。数值和 top-1 token 都对齐之后，CPU F32 主路径才有对照基准。
 
 前面几章已经把真实模型路径上的关键模块接起来了：
 
@@ -660,6 +660,72 @@ ctest --test-dir build -R mini-llama-tests --output-on-failure
   --verbose
 ```
 
+## Python 参考对齐
+
+前面的章节已经把推理主链路、量化、多线程和 SIMD 接上了。程序能吐出 token，单元测试也能过，但还有一类问题看不出来：每一步 logits 和一份更直观的数学实现是不是同一组数。
+
+RMSNorm 的 `eps` 用错、RoPE 的位置传偏、GQA 的 kv head 映射错了、KV cache 写进了错误的 `pos`、`lm_head` 的矩阵方向反了，这些都不会让程序直接崩。终端照样打印 token，最后的文本对不上时，也分不清问题在模型、采样还是底层计算。
+
+所以这里放一条 Python 参考链路。`scripts/reference_forward.py` 用 NumPy 写一份朴素的 Transformer 前向，没有工程层，也没有优化。函数里直接是 embedding、RMSNorm、Q/K/V、RoPE、KV cache、attention、FFN、final norm 和 `lm_head`。核心函数是 `forward_token(model, pos, token_id)`，一次处理一个 token，语义和 C++ 的 `ForwardBatch` decode 一致。KV cache 放在 `model["kv_cache"]` 里，第一次调用时创建，后面持续写入同一个缓存，prefill 写进去的 K/V 会继续影响 decode，对应 C++ 的 `MiniLlamaContext`。
+
+tiny model 用简单 tokenizer：BOS 固定是 `1`，prompt 字符转成 ASCII token，范围 `0..127`。`hello` 的 prompt token 是 6 个：`[1, 104, 101, 108, 108, 111]`。`-n 16` 表示再生成 16 个 token，所以一共 21 份 logits：6 份来自 prefill，15 份来自 decode。第一个生成 token 从最后一份 prefill logits 里取出来，decode 的 logits 文件数比生成 token 数少 1。
+
+每个 `python_logits_step*.bin` 和 C++ 的 `logits_step*.bin` 都是连续 float32，长度等于 `vocab_size`。tiny model 的 `vocab_size` 是 128。`python_generation_tokens.txt` 和 `generation_tokens.txt` 放 greedy 采样得到的 token id。
+
+正常生成时，prefill 把整个 prompt 当成一个 batch 送进 `ForwardBatch()`。打开 `--dump-logits` 之后，C++ 把 prompt token 拆成逐个 step，每个 prompt token 落一份 logits，文件数才能和 Python 对齐。这套逐步导出只给调试和回归用。平时 prefill 继续走 batch。
+
+`scripts/compare_logits.py` 检查三件事：两边的 step 编号必须一致，缺一个就失败；每一步算 `max_abs_error` 和 `max_rel_error`；每一步的 top-1 token 一致，最后的生成 token 序列也一致。通过标准是 `max_abs_error <= 1e-4` 且 `max_rel_error <= 1e-4`。相对误差只在 `|py| >= 1e-3` 时计算，靠近 0 的数做除法会把噪声放大。
+
+日常回归直接跑 `scripts/test_golden.py`。它建一个临时目录，按固定顺序走 `generate --dump-logits`、`make_golden.py`、`compare_logits.py`。默认二进制是 `build/mini-llama`。CTest 里通过 `MINI_LLAMA_BIN=$<TARGET_FILE:mini-llama>` 传入刚编出来的程序，工作目录是源码根目录，这样 `models/tiny` 能被找到。
+
+这条测试只覆盖 tiny model 的 F32 主路径。改了 `ForwardBatch()`、RMSNorm、RoPE、KV cache、sampler、matmul dispatch、多线程或 SIMD，都该跑一次 `golden-logits`。量化和真实 GGUF 模型各有自己的测试。Q8_0 / Q4_0 改了权重表示，logits 残差本来就比 F32 大，不要拿量化结果去对这份 golden。
+
+对不上的时候先看是哪一步开始分叉：
+
+- 所有 step 都发散：先查权重读取、embedding、RMSNorm 的 `eps`、矩阵维度和转置方向。tiny model 两边读的是同一份文件。
+- prefill 对齐、decode 开始发散：看 KV cache 的 `pos`，或者 GQA 的 `head -> kv_head` 映射。decode 每一步都复用历史 K/V。
+- 误差不大但只有 top-1 分叉：最大 logits 附近的候选很接近，再查 sampler 的 tie-breaking。当前 greedy 走 argmax。
+- Naive 通过、SIMD 或多线程失败：查尾部元素、浮点累加顺序、线程切片边界。`scripts/test_threaded_cli.py` 会比较 `--threads 1` 和 `--threads 4` 的 logits。
+
+## 本章验证
+
+检查 Python 参考对齐时，建议确认这些结果：
+
+- `Comparing 21 steps...`，`hello` 加 `-n 16` 正好 21 份 logits。
+- 每一步 `max_abs_error <= 1e-4`，`max_rel_error <= 1e-4`。
+- 每一步 top-1 token 一致。
+- `generation tokens: PASS`。
+- 最后一行是 `RESULT: ALL PASSED`。
+
+建议运行：
+
+```bash
+cmake --build build -j4
+ctest --test-dir build -R golden-logits --output-on-failure
+```
+
+也可以手动走一遍，看中间文件：
+
+```bash
+./build/mini-llama generate \
+  --model models/tiny \
+  --prompt hello \
+  --n-predict 16 \
+  --dump-logits artifacts/golden
+
+python3 scripts/make_golden.py \
+  --config models/tiny/model.json \
+  --weights models/tiny/model.bin \
+  --prompt hello \
+  -n 16 \
+  --output-dir artifacts/golden
+
+python3 scripts/compare_logits.py \
+  --cpp-dir artifacts/golden \
+  --py-dir artifacts/golden \
+  --vocab-size 128
+```
+
 ## Q4_0 本章验证
 
 检查 Q4_0 时，建议确认这些结果：
@@ -718,7 +784,11 @@ mini-llama/
 │   ├── export_gguf_tokenizer.py
 │   ├── make_test_gguf.py
 │   ├── test_real_model_smoke.py
-│   └── test_threaded_cli.py
+│   ├── test_threaded_cli.py
+│   ├── reference_forward.py
+│   ├── make_golden.py
+│   ├── compare_logits.py
+│   └── test_golden.py
 ├── src/                    对应实现
 └── tests/
     ├── test_tensor.cc / test_ops.cc
