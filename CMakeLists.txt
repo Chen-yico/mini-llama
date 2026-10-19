@@ -91,4 +91,12 @@ if(Python3_Interpreter_FOUND)
             ${CMAKE_SOURCE_DIR}/scripts/test_threaded_cli.py
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   )
+  add_test(
+    NAME golden-logits
+    COMMAND ${CMAKE_COMMAND} -E env
+            MINI_LLAMA_BIN=$<TARGET_FILE:mini-llama>
+            ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/scripts/test_golden.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  )
 endif()
