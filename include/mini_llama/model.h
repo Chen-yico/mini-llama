@@ -4,9 +4,11 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "mini_llama/cuda_runtime.h"
 #include "mini_llama/ops.h"
 #include "mini_llama/quantized_tensor.h"
 #include "mini_llama/tensor.h"
@@ -45,6 +47,32 @@ struct LayerWeights {
   QuantizedTensor w_down;  // [dim, hidden_dim]
 };
 
+struct CudaUploadedWeight {
+  std::string name;
+  QuantType type = QuantType::kF32;
+  bool linear = true;
+  std::vector<int> shape;
+  size_t block_count = 0;
+  CudaDeviceBuffer buffer;
+};
+
+struct CudaModelWeights {
+  int device_id = 0;
+  size_t uploaded_weight_count = 0;
+  size_t uploaded_bytes = 0;
+  size_t linear_calls = 0;
+  size_t activation_calls = 0;
+  size_t attention_calls = 0;
+  size_t attention_cpu_fallbacks = 0;
+  size_t kv_cache_write_bytes = 0;
+  size_t kv_cache_read_bytes = 0;
+  size_t host_to_device_copies = 0;
+  size_t device_to_host_copies = 0;
+  size_t host_to_device_bytes = 0;
+  size_t device_to_host_bytes = 0;
+  std::vector<CudaUploadedWeight> weights;
+};
+
 struct MiniLlamaModel {
   ModelConfig config;
   bool loaded = false;
@@ -53,6 +81,7 @@ struct MiniLlamaModel {
   std::vector<LayerWeights> layers;  // [n_layers]
   Tensor final_norm;                 // [dim]
   QuantizedTensor lm_head;           // [vocab_size, dim]
+  std::shared_ptr<CudaModelWeights> cuda_weights;
 };
 
 // Allocate F32 weights and fill them with deterministic values for tests / CLI.
@@ -63,6 +92,28 @@ size_t ModelWeightBytes(const MiniLlamaModel& model);
 
 // Bytes the same weights would consume if stored as F32.
 size_t ModelWeightBytesF32(const MiniLlamaModel& model);
+
+// Upload CUDA-supported resident weights and keep the CPU copies intact.
+void UploadModelWeightsToCuda(MiniLlamaModel& model, int device_id = 0);
+void ClearModelCudaWeights(MiniLlamaModel& model);
+bool ModelHasCudaWeights(const MiniLlamaModel& model);
+size_t ModelCudaUploadedWeightCount(const MiniLlamaModel& model);
+size_t ModelCudaUploadedF32WeightCount(const MiniLlamaModel& model);
+size_t ModelCudaUploadedQ80WeightCount(const MiniLlamaModel& model);
+size_t ModelCudaUploadedQ40WeightCount(const MiniLlamaModel& model);
+size_t ModelCudaUploadedQ41WeightCount(const MiniLlamaModel& model);
+size_t ModelCudaMemoryBytes(const MiniLlamaModel& model);
+void ResetModelCudaRuntimeStats(MiniLlamaModel& model);
+size_t ModelCudaLinearCalls(const MiniLlamaModel& model);
+size_t ModelCudaActivationCalls(const MiniLlamaModel& model);
+size_t ModelCudaAttentionCalls(const MiniLlamaModel& model);
+size_t ModelCudaAttentionCpuFallbacks(const MiniLlamaModel& model);
+size_t ModelCudaKvCacheWriteBytes(const MiniLlamaModel& model);
+size_t ModelCudaKvCacheReadBytes(const MiniLlamaModel& model);
+size_t ModelCudaHostToDeviceCopies(const MiniLlamaModel& model);
+size_t ModelCudaDeviceToHostCopies(const MiniLlamaModel& model);
+size_t ModelCudaHostToDeviceBytes(const MiniLlamaModel& model);
+size_t ModelCudaDeviceToHostBytes(const MiniLlamaModel& model);
 
 // Convert Linear weight QuantizedTensors from F32 (or other) to Q8_0 in-place.
 // Embedding, norm, and bias tensors remain unchanged.

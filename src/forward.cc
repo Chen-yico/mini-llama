@@ -199,6 +199,10 @@ Tensor ForwardToken(MiniLlamaContext& ctx, const MiniLlamaModel& model,
                     int token) {
   ValidateForwardInputs(ctx, model, token);
 
+  if (model.cuda_weights) {
+    return ForwardTokenDevice(ctx, model, token);
+  }
+
   const ModelConfig& config = model.config;
   Tensor x = EmbedToken(model, token);
   for (int layer = 0; layer < config.n_layers; ++layer) {

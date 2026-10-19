@@ -2,7 +2,7 @@
 
 从零实现的 LLaMA 风格 C++ 推理引擎，按课程步骤逐步搭建。
 
-当前进度：**Python 参考对齐** — 用 NumPy 把同一个 tiny 模型、同一段 greedy 生成再跑一遍，逐步比较 logits。数值和 top-1 token 都对齐之后，CPU F32 主路径才有对照基准。
+当前进度：**CUDA Backend 总览** — 默认仍走 CPU。打开 `MINI_LLAMA_CUDA` 之后，`generate`、`run`、`bench`、`inspect` 可以用 `--backend cuda` 把计算留在显存里，logits 回到 CPU 采样。
 
 前面几章已经把真实模型路径上的关键模块接起来了：
 
@@ -12,7 +12,7 @@
 - `PromptBuilder` 负责把对话消息拼成 Qwen2 ChatML prompt。
 - Forward、KV Cache 和 Sampler 负责完成自回归生成。
 
-Smoke test 只判断链路是否稳定可用。短输出的内容质量不代表模型完整能力，尤其是 `-n 1` 或 `-n 3` 这种极短生成。本仓库是 CPU 路径，不包含 CUDA。`bench --quant q8_0|q4_0` 会在加载后临时量化 Linear 权重，用来对照体积和 logits 误差。
+Smoke test 只判断链路是否稳定可用。短输出的内容质量不代表模型完整能力，尤其是 `-n 1` 或 `-n 3` 这种极短生成。默认构建是 CPU。CUDA 后端用 `-DMINI_LLAMA_CUDA=ON` 打开，当前只支持单机单卡。`bench --quant q8_0|q4_0` 会在加载后临时量化 Linear 权重，用来对照体积和 logits 误差。
 
 ## 环境要求
 
@@ -214,7 +214,7 @@ Decode tokens:    3
   --quant q8_0
 ```
 
-本仓库只走 CPU。CUDA backend 指标（uploaded weights、host/device copy、GPU kernel 调用次数）等进入后续 CUDA 章节后再作为 GPU benchmark 的判断依据。当前先把 CPU 路径测准。
+这一节测的是 CPU 量化。CUDA 的 uploaded weights、host/device copy 和 kernel 次数放在后面的 CUDA Backend 总览里看。
 
 ### 输出怎么看
 
@@ -565,7 +565,7 @@ worker 里的异常先存进 `std::exception_ptr`，所有线程 `join()` 之后
 
 通用 `MatmulThreaded()` 按输出矩阵的行切，也就是 `M` 维。每个线程负责若干行，`c[i, j]` 只由对应线程写一次。通用矩阵乘的 SIMD 模式仍回到这条路径，因为右矩阵按列访问，内存不连续。
 
-`src/forward.cc` 里的 CPU Attention 按 head 切：`ParallelFor(n_heads, ...)`，每个 head 写自己的 `attn_out[h, :]`。本仓库是 CPU 路径，这条切分只服务 CPU Attention。
+`src/forward.cc` 里的 CPU Attention 按 head 切：`ParallelFor(n_heads, ...)`，每个 head 写自己的 `attn_out[h, :]`。这条切分只服务 CPU Attention。CUDA 路径用显存里的 KV cache 和单独的 attention kernel。
 
 `ParallelFor()` 适合粗粒度循环，例如 `out_features` 和 `n_heads`。放进很细的内层循环时，调度成本会吃掉收益。
 
@@ -726,6 +726,80 @@ python3 scripts/compare_logits.py \
   --vocab-size 128
 ```
 
+## CUDA Backend 总览
+
+CPU 路径已经覆盖 GGUF 解析、BPE 分词、基础算子、多线程、量化和 Python logits 对齐。这些结果是 CUDA 路径的正确性底座。CUDA 侧复用同一套 Transformer 拓扑，只把计算密集的算子换成 GPU 实现，再拿 CPU logits 做数值对照。遇到不支持的量化类型、异常维度或显存不够时，计算可以退回 CPU。
+
+后端入口在 `include/mini_llama/backend.h`：
+
+```cpp
+enum class BackendKind { kCpu, kCuda };
+
+struct BackendConfig {
+  BackendKind kind = BackendKind::kCpu;
+  int device_id = 0;
+  bool device_id_set = false;
+};
+```
+
+`device_id` 留给 `--device <N>`。当前实现以单卡为主，显存分配和 kernel 提交都绑在这一张卡上。`ParseBackendKind()` 只接受 `cpu` 和 `cuda`，命令行解析和推理内核分开：参数先变成 `BackendConfig`，内核只看这份配置。
+
+`generate`、`run`、`bench`、`inspect` 都接受 `--backend cpu|cuda`。没有装 CUDA 工具链时，`--backend cuda` 会直接说明需要 `-DMINI_LLAMA_CUDA=ON`。`--cuda-info` 打印设备名、计算能力、显存、驱动和 runtime 版本。
+
+CPU decode 全程留在内存里：embedding、RMSNorm、QKV、RoPE、KV cache、attention、FFN、final norm、lm_head、sampler 都不跨设备。切到 CUDA 之后，这条骨架不变，只是中间张量换成 `CudaTensor`。embedding、QKV、RoPE、KV 写入、attention、FFN 和 lm_head 都留在显存里，只有最终 logits 做一次 device-to-host，再交给 CPU sampler。采样本身很轻，不值得为它再写一套 GPU 采样。
+
+模型加载后如果请求了量化，会先改 CPU 上的权重，再调用 `UploadModelWeightsToCuda()`。F32、Q8_0、Q4_0、Q4_1 的 Linear 权重，以及 embedding、RMSNorm 和 bias，按名字上传到显存。CPU 侧的原权重还留着，fallback 和对照都能用。
+
+`forward.cc` 里设备路径的入口是这些函数，输入和输出都是 `CudaTensor`：
+
+- `EmbedTokenDevice`
+- `ForwardRmsNormDevice`
+- `ForwardLinearDevice`
+- `ForwardRopeDevice`
+- `AttentionForwardDevice`
+- `FfnForwardDevice`
+- `ForwardLayerDevice`
+- `ComputeLogitsDevice`
+
+运行时计数写在 `CudaModelWeights` 上，用来确认程序到底走了哪条路：
+
+| 指标 | 含义 |
+| --- | --- |
+| uploaded weights | 成功上传到显存的权重数量 |
+| gpu bytes | 上传权重大小 |
+| cuda Linear calls | 矩阵乘相关的 CUDA 调用次数 |
+| cuda activation calls | RMSNorm、RoPE、激活函数等 CUDA 调用次数 |
+| cuda attention calls | 在 GPU 上执行 attention 的次数 |
+| cpu attention fallback calls | 退回 CPU 执行 attention 的次数 |
+| host->device copies | 运行时从内存拷到显存的次数和字节数 |
+| device->host copies | 运行时从显存拷回内存的次数和字节数 |
+
+`uploaded weights` 偏少，说明有权重没上去，后面的计算会退回 CPU。`cpu attention fallback calls` 不为 0，说明 attention 没留在显存。decode 过程中 `host->device copies` 持续增加，说明中间结果在 PCIe 上来回搬。Q8_0 且 attention fallback 为 0 时，decode 主路径才算显存常驻。
+
+和 llama.cpp 的对应关系保持在这一层：`BackendKind::kCuda` 对后端选择，`CudaDeviceBuffer` 对设备显存，`CudaTensor` 对常驻张量，`UploadModelWeightsToCuda` 对权重上显存，CUDA Linear / activation kernel 对 matmul 和逐元素算子，`CudaKvCache` 对 GPU KV cache，CUDA attention decode 对注意力 kernel，运行时计数对 backend profiling。
+
+## 本章验证
+
+这一章先确认 CPU 基准构建仍然能跑。有 NVIDIA GPU 和 CUDA 工具链时，再编 CUDA 版本。
+
+```bash
+cmake -S . -B build
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
+```
+
+```bash
+nvidia-smi
+nvcc --version
+cmake -S . -B build-cuda -DMINI_LLAMA_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cuda -j4
+ctest --test-dir build-cuda --output-on-failure
+./build-cuda/mini-llama --cuda-info
+./build-cuda/mini-llama bench models/chat --backend cuda -p hello -n 8
+```
+
+CPU 构建上，`--backend cpu` 应打印 `backend: cpu` 和 `compute: cpu`。`--backend cuda` 与 `--cuda-info` 会说明 CUDA 后端没有编进来。CUDA 构建上，`uploaded weights`、`cuda attention calls` 和 `cpu attention fallback calls` 用来确认 decode 有没有留在显存里。
+
 ## Q4_0 本章验证
 
 检查 Q4_0 时，建议确认这些结果：
@@ -788,7 +862,10 @@ mini-llama/
 │   ├── reference_forward.py
 │   ├── make_golden.py
 │   ├── compare_logits.py
-│   └── test_golden.py
+│   ├── test_golden.py
+│   ├── test_backend_cli.py
+│   ├── test_cuda_chat_smoke.py
+│   └── run_cuda_benchmarks.py
 ├── src/                    对应实现
 └── tests/
     ├── test_tensor.cc / test_ops.cc

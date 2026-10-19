@@ -9,11 +9,13 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "mini_llama/backend.h"
 #include "mini_llama/batch.h"
 #include "mini_llama/chat.h"
 #include "mini_llama/context.h"
@@ -40,22 +42,28 @@ void PrintUsage(const char* program) {
       << "  " << program
       << " generate [--model path|dir] [--tokenizer vocab.json] [-p prompt] "
          "[-n tokens] [--temperature T] [--top-k k] [--seed S] [--threads N] "
-         "[--quant q8_0|q4_0] [--dump-logits dir]\n"
-      << "  " << program << " inspect <model-path|dir>\n"
+         "[--quant q8_0|q4_0] [--dump-logits dir] [--backend cpu|cuda] "
+         "[--device N]\n"
+      << "  " << program
+      << " inspect <model-path|dir> [--backend cpu|cuda] [--device N]\n"
       << "  " << program << " inspect-gguf <path>\n"
       << "  " << program
       << " run [model-path|dir] [--tokenizer vocab.json] [-n tokens] "
-         "[--temperature T] [--top-k k] [--seed S] [--synthetic]\n"
+         "[--temperature T] [--top-k k] [--seed S] [--synthetic] "
+         "[--backend cpu|cuda] [--device N]\n"
       << "  " << program
       << " bench <model-path|dir> [-p prompt] [-n tokens] [--seed S] "
          "[--tokenizer vocab.json] [--quant q8_0|q4_0] [--threads N] "
-         "[--verbose]\n\n"
+         "[--verbose] [--backend cpu|cuda] [--device N]\n"
+      << "  " << program << " --cuda-info\n\n"
       << "Commands:\n"
-      << "  generate     Tokenize, run CPU forward, and sample tokens.\n"
-      << "  inspect      Print model.json metadata and load JSON+BIN weights.\n"
+      << "  generate     Tokenize, run forward, and sample tokens.\n"
+      << "  inspect      Print model metadata and load weights.\n"
       << "  inspect-gguf Print GGUF header, metadata, and tensor index.\n"
       << "  run          Interactive multi-turn chat.\n"
-      << "  bench        Measure prefill / decode timing and weight memory.\n";
+      << "  bench        Measure prefill / decode timing and weight memory.\n"
+      << "  --cuda-info  Print CUDA device name, memory, and versions.\n"
+      << "\n--backend cuda requires -DMINI_LLAMA_CUDA=ON. The default is cpu.\n";
 }
 
 bool ParsePositiveInt(const std::string& text, int& value) {
@@ -355,6 +363,182 @@ void PrintCpuBanner() {
   std::cout << "mini-llama\n==============\n\nbackend: cpu\ncompute: cpu\n";
 }
 
+bool ParseBackendArg(const std::string& text, mini_llama::BackendConfig& config) {
+  mini_llama::BackendKind kind;
+  if (!mini_llama::ParseBackendKind(text, kind)) {
+    return false;
+  }
+  config.kind = kind;
+  return true;
+}
+
+bool ParseDeviceArg(const std::string& text, mini_llama::BackendConfig& config) {
+  int device_id = 0;
+  if (!ParseNonNegativeInt(text, device_id)) {
+    return false;
+  }
+  config.device_id = device_id;
+  config.device_id_set = true;
+  return true;
+}
+
+bool ValidateBackendOrPrint(const mini_llama::BackendConfig& config) {
+  try {
+    mini_llama::ValidateBackend(config);
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Backend setup failed: " << e.what() << "\n";
+    return false;
+  }
+}
+
+void PrintBackendInfo(const mini_llama::BackendConfig& config) {
+  std::cout << "backend: " << mini_llama::BackendKindName(config.kind) << "\n";
+  if (config.kind == mini_llama::BackendKind::kCuda) {
+    std::cout << "cuda: " << mini_llama::CudaDeviceSummary(config.device_id)
+              << "\n";
+  }
+  std::cout << mini_llama::BackendExecutionNote(config) << "\n";
+}
+
+std::string FormatMb(size_t bytes) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(2)
+      << (static_cast<double>(bytes) / (1024.0 * 1024.0)) << " MB";
+  return out.str();
+}
+
+bool PrepareCudaWeightsOrPrint(mini_llama::MiniLlamaModel& model,
+                               const mini_llama::BackendConfig& config) {
+  if (config.kind != mini_llama::BackendKind::kCuda) {
+    return true;
+  }
+  try {
+    mini_llama::UploadModelWeightsToCuda(model, config.device_id);
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "CUDA weight upload failed: " << e.what() << "\n";
+    return false;
+  }
+}
+
+struct LinearWeightTypeCounts {
+  size_t f32 = 0;
+  size_t q8_0 = 0;
+  size_t q4_0 = 0;
+  size_t q4_1 = 0;
+  size_t total() const { return f32 + q8_0 + q4_0 + q4_1; }
+};
+
+void CountLinearWeight(const mini_llama::QuantizedTensor& weight,
+                       LinearWeightTypeCounts& counts) {
+  switch (weight.type) {
+    case mini_llama::QuantType::kF32:
+      counts.f32 += 1;
+      break;
+    case mini_llama::QuantType::kQ80:
+      counts.q8_0 += 1;
+      break;
+    case mini_llama::QuantType::kQ40:
+      counts.q4_0 += 1;
+      break;
+    case mini_llama::QuantType::kQ41:
+      counts.q4_1 += 1;
+      break;
+  }
+}
+
+LinearWeightTypeCounts ModelLinearWeightTypeCounts(
+    const mini_llama::MiniLlamaModel& model) {
+  LinearWeightTypeCounts counts;
+  CountLinearWeight(model.lm_head, counts);
+  for (const auto& lw : model.layers) {
+    CountLinearWeight(lw.wq, counts);
+    CountLinearWeight(lw.wk, counts);
+    CountLinearWeight(lw.wv, counts);
+    CountLinearWeight(lw.wo, counts);
+    CountLinearWeight(lw.w_gate, counts);
+    CountLinearWeight(lw.w_up, counts);
+    CountLinearWeight(lw.w_down, counts);
+  }
+  return counts;
+}
+
+void PrintCudaWeightSummary(const mini_llama::MiniLlamaModel& model,
+                            const std::string& indent = "") {
+  std::cout << indent << "uploaded weights: "
+            << mini_llama::ModelCudaUploadedWeightCount(model) << "\n";
+  std::cout << indent << "gpu memory used: "
+            << mini_llama::ModelCudaMemoryBytes(model) << " bytes ("
+            << FormatMb(mini_llama::ModelCudaMemoryBytes(model)) << ")\n";
+}
+
+void PrintCudaExecutionSummary(const mini_llama::MiniLlamaModel& model,
+                               const std::string& indent = "") {
+  PrintCudaWeightSummary(model, indent);
+  LinearWeightTypeCounts counts = ModelLinearWeightTypeCounts(model);
+  const size_t uploaded_f32 = mini_llama::ModelCudaUploadedF32WeightCount(model);
+  const size_t uploaded_q8_0 = mini_llama::ModelCudaUploadedQ80WeightCount(model);
+  const size_t uploaded_q4_0 = mini_llama::ModelCudaUploadedQ40WeightCount(model);
+  const size_t uploaded_q4_1 = mini_llama::ModelCudaUploadedQ41WeightCount(model);
+  std::cout << indent << "cuda f32 Linear weights: " << uploaded_f32 << "/"
+            << counts.total() << "\n";
+  if (counts.q8_0 > 0) {
+    std::cout << indent << "cuda q8_0 Linear weights: " << uploaded_q8_0 << "/"
+              << counts.q8_0 << "\n";
+  }
+  if (counts.q4_0 > 0) {
+    std::cout << indent << "cuda q4_0 Linear weights: " << uploaded_q4_0 << "/"
+              << counts.q4_0 << "\n";
+  }
+  if (counts.q4_1 > 0) {
+    std::cout << indent << "cuda q4_1 Linear weights: " << uploaded_q4_1 << "/"
+              << counts.q4_1 << "\n";
+  }
+}
+
+void PrintCudaRuntimeSummary(const mini_llama::MiniLlamaModel& model,
+                             const std::string& indent = "") {
+  std::cout << indent << "cuda Linear calls: "
+            << mini_llama::ModelCudaLinearCalls(model) << "\n";
+  std::cout << indent << "cuda activation calls: "
+            << mini_llama::ModelCudaActivationCalls(model) << "\n";
+  std::cout << indent << "cuda attention calls: "
+            << mini_llama::ModelCudaAttentionCalls(model) << "\n";
+  std::cout << indent << "cpu attention fallback calls: "
+            << mini_llama::ModelCudaAttentionCpuFallbacks(model) << "\n";
+  std::cout << indent << "host->device copies: "
+            << mini_llama::ModelCudaHostToDeviceCopies(model) << " ("
+            << mini_llama::ModelCudaHostToDeviceBytes(model) << " bytes)\n";
+  std::cout << indent << "device->host copies: "
+            << mini_llama::ModelCudaDeviceToHostCopies(model) << " ("
+            << mini_llama::ModelCudaDeviceToHostBytes(model) << " bytes)\n";
+}
+
+int RunCudaInfo() {
+  try {
+    const int count = mini_llama::CudaDeviceCount();
+    std::cout << "CUDA devices: " << count << "\n";
+    for (int device_id = 0; device_id < count; ++device_id) {
+      mini_llama::CudaDeviceInfo info = mini_llama::CudaGetDeviceInfo(device_id);
+      const double total_gb =
+          static_cast<double>(info.total_memory_bytes) / (1024.0 * 1024.0 * 1024.0);
+      std::cout << "device " << info.id << ": " << info.name << "\n"
+                << "  device name: " << info.name << "\n"
+                << "  compute capability: " << info.compute_major << "."
+                << info.compute_minor << "\n"
+                << "  total memory: " << info.total_memory_bytes << " bytes ("
+                << std::fixed << std::setprecision(2) << total_gb << " GB)\n"
+                << "  driver version: " << info.driver_version << "\n"
+                << "  runtime version: " << info.runtime_version << "\n";
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "CUDA info failed: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 void PrintIntList(const char* label, const std::vector<int>& values) {
   std::cout << label << " [";
   for (size_t i = 0; i < values.size(); ++i) {
@@ -432,6 +616,7 @@ int RunGenerate(int argc, char** argv) {
   std::string explicit_tokenizer_path;
   std::string quant_type;
   std::string dump_logits_dir;
+  mini_llama::BackendConfig backend_config;
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
@@ -510,6 +695,25 @@ int RunGenerate(int argc, char** argv) {
         return 1;
       }
       dump_logits_dir = argv[++i];
+    } else if (arg == "--backend") {
+      if (i + 1 >= argc) {
+        std::cerr << "missing value for " << arg << "\n";
+        return 1;
+      }
+      if (!ParseBackendArg(argv[++i], backend_config)) {
+        std::cerr << "Invalid --backend value. Supported values: cpu, cuda.\n";
+        return 1;
+      }
+    } else if (arg == "--device") {
+      if (i + 1 >= argc) {
+        std::cerr << "missing value for " << arg << "\n";
+        return 1;
+      }
+      if (!ParseDeviceArg(argv[++i], backend_config)) {
+        std::cerr
+            << "Invalid --device value. Expected a non-negative integer.\n";
+        return 1;
+      }
     } else if (arg == "-h" || arg == "--help") {
       PrintUsage(argv[0]);
       return 0;
@@ -525,6 +729,10 @@ int RunGenerate(int argc, char** argv) {
     return 1;
   }
 
+  if (!ValidateBackendOrPrint(backend_config)) {
+    return 1;
+  }
+
   if (!dump_logits_dir.empty()) {
     try {
       EnsureDumpDirectory(dump_logits_dir);
@@ -534,11 +742,12 @@ int RunGenerate(int argc, char** argv) {
     }
   }
 
-  PrintCpuBanner();
+  std::cout << "mini-llama\n==============\n\n";
+  PrintBackendInfo(backend_config);
 
   const std::string resolved = ResolveModelPath(model_path);
-  mini_llama::RequestContext request =
-      mini_llama::StartRequest("generate", "cpu", resolved);
+  mini_llama::RequestContext request = mini_llama::StartRequest(
+      "generate", mini_llama::BackendKindName(backend_config.kind), resolved);
 
   auto stage_start = mini_llama::RequestClock::now();
   mini_llama::MiniLlamaModel model = LoadWeightsFromPath(model_path);
@@ -556,6 +765,13 @@ int RunGenerate(int argc, char** argv) {
   }
   request.RecordEvent("quantize", mini_llama::ElapsedMs(stage_start), 0,
                       quant_label);
+  if (!PrepareCudaWeightsOrPrint(model, backend_config)) {
+    return FailRequest(request, "CUDA weight preparation failed");
+  }
+  if (backend_config.kind == mini_llama::BackendKind::kCuda) {
+    PrintCudaExecutionSummary(model);
+    std::cout << "\n";
+  }
 
   std::unique_ptr<mini_llama::ITokenizer> tokenizer;
   if (EndsWithGguf(resolved)) {
@@ -709,6 +925,9 @@ int RunGenerate(int argc, char** argv) {
   std::cout << "\n";
   PrintIntList("generated tokens:", generated);
   std::cout << "generated text: \"" << tokenizer->Decode(generated) << "\"\n";
+  if (backend_config.kind == mini_llama::BackendKind::kCuda) {
+    PrintCudaRuntimeSummary(model);
+  }
   mini_llama::PrintRequestTrace(request, std::cout);
   return 0;
 }
@@ -724,12 +943,60 @@ int RunInspect(int argc, char** argv) {
     PrintUsage(argv[0]);
     return 1;
   }
-  if (argc > 3) {
-    std::cerr << "unknown option: " << argv[3] << "\n";
+
+  std::string model_path;
+  mini_llama::BackendConfig backend_config;
+  for (int i = 2; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--backend") {
+      if (i + 1 >= argc || !ParseBackendArg(argv[++i], backend_config)) {
+        std::cerr << "Invalid --backend value. Supported values: cpu, cuda.\n";
+        return 1;
+      }
+    } else if (arg == "--device") {
+      if (i + 1 >= argc || !ParseDeviceArg(argv[++i], backend_config)) {
+        std::cerr
+            << "Invalid --device value. Expected a non-negative integer.\n";
+        return 1;
+      }
+    } else if (arg == "-h" || arg == "--help") {
+      PrintUsage(argv[0]);
+      return 0;
+    } else if (!arg.empty() && arg[0] == '-') {
+      std::cerr << "unknown option: " << arg << "\n";
+      return 1;
+    } else if (model_path.empty()) {
+      model_path = arg;
+    } else {
+      std::cerr << "unknown option: " << arg << "\n";
+      return 1;
+    }
+  }
+  if (model_path.empty()) {
+    std::cerr << "Missing model path.\n";
     return 1;
   }
+  if (!ValidateBackendOrPrint(backend_config)) {
+    return 1;
+  }
+  if (backend_config.kind == mini_llama::BackendKind::kCuda) {
+    mini_llama::MiniLlamaModel model = LoadWeightsFromPath(model_path);
+    if (!model.loaded) {
+      std::cerr << "Failed to load model: " << model.load_error << "\n";
+      return 1;
+    }
+    if (!PrepareCudaWeightsOrPrint(model, backend_config)) {
+      return 1;
+    }
+    PrintBackendInfo(backend_config);
+    PrintCudaExecutionSummary(model);
+    const std::string resolved = ResolveModelPath(model_path);
+    if (EndsWithGguf(resolved)) {
+      std::cout << "GGUF model loaded successfully\n";
+    }
+    return 0;
+  }
 
-  const std::string model_path = argv[2];
   std::filesystem::path json_path;
   std::filesystem::path bin_path;
   if (std::filesystem::is_directory(model_path)) {
@@ -764,7 +1031,7 @@ int RunInspect(int argc, char** argv) {
     std::cerr << "Failed to load model: " << model.load_error << "\n";
     return 1;
   }
-  std::cout << "backend: cpu\n";
+  PrintBackendInfo(backend_config);
   return 0;
 }
 
@@ -805,6 +1072,8 @@ void PrintBenchUsage(const char* prog) {
       << "  --threads <n>         Number of threads for parallel ops (0 = "
          "auto)\n"
       << "  --verbose             Print debug dumps after each step\n"
+      << "  --backend cpu|cuda    Execution backend (default: cpu)\n"
+      << "  --device <n>          CUDA device id for --backend cuda\n"
       << "  -h, --help            Show this help\n";
 }
 
@@ -829,6 +1098,7 @@ int RunBench(int argc, char** argv) {
   bool verbose = false;
   std::string quant_type;
   int n_threads = 0;
+  mini_llama::BackendConfig backend_config;
 
   for (int i = 3; i < argc; ++i) {
     std::string arg = argv[i];
@@ -855,6 +1125,17 @@ int RunBench(int argc, char** argv) {
       }
     } else if (arg == "--verbose") {
       verbose = true;
+    } else if (arg == "--backend" && i + 1 < argc) {
+      if (!ParseBackendArg(argv[++i], backend_config)) {
+        std::cerr << "Invalid --backend value. Supported values: cpu, cuda.\n";
+        return 1;
+      }
+    } else if (arg == "--device" && i + 1 < argc) {
+      if (!ParseDeviceArg(argv[++i], backend_config)) {
+        std::cerr
+            << "Invalid --device value. Expected a non-negative integer.\n";
+        return 1;
+      }
     } else if (arg == "-h" || arg == "--help") {
       PrintBenchUsage(argv[0]);
       return 0;
@@ -868,6 +1149,9 @@ int RunBench(int argc, char** argv) {
   if (!quant_type.empty() && quant_type != "q8_0" && quant_type != "q4_0") {
     std::cerr << "Invalid --quant value: " << quant_type
               << ". Supported values: q8_0, q4_0.\n";
+    return 1;
+  }
+  if (!ValidateBackendOrPrint(backend_config)) {
     return 1;
   }
 
@@ -914,10 +1198,12 @@ int RunBench(int argc, char** argv) {
     std::cerr << "Quantization failed: " << e.what() << "\n";
     return 1;
   }
+  if (!PrepareCudaWeightsOrPrint(model, backend_config)) {
+    return 1;
+  }
 
   std::cout << "Benchmark: " << model_dir << "\n";
-  std::cout << "  backend: cpu\n";
-  std::cout << "  compute: cpu\n";
+  PrintBackendInfo(backend_config);
   std::cout << "  prompt: \"" << prompt << "\" (" << tokens.size()
             << " tokens)\n";
   mini_llama::SetThreadCount(n_threads);
@@ -927,6 +1213,10 @@ int RunBench(int argc, char** argv) {
             << "\n";
   std::cout << "  threads: " << mini_llama::GetThreadCount() << "\n";
   std::cout << "  verbose: " << (verbose ? "true" : "false") << "\n\n";
+  if (backend_config.kind == mini_llama::BackendKind::kCuda) {
+    PrintCudaExecutionSummary(model, "  ");
+    std::cout << "\n";
+  }
 
   mini_llama::BenchmarkResult result =
       mini_llama::RunBenchmark(model, tokens, n_predict, seed, verbose);
@@ -960,6 +1250,10 @@ int RunBench(int argc, char** argv) {
                        : static_cast<double>(f32_bytes) / actual_bytes;
   std::cout << "    savings:   " << std::fixed << std::setprecision(2)
             << savings << "x compression\n";
+  if (backend_config.kind == mini_llama::BackendKind::kCuda) {
+    std::cout << "\n  cuda runtime:\n";
+    PrintCudaRuntimeSummary(model, "    ");
+  }
 
   if (!quant_type.empty()) {
     try {
@@ -997,6 +1291,7 @@ int RunChat(int argc, char** argv) {
   int max_response_tokens = 64;
   mini_llama::SamplingParams sampling_params;
   bool use_synthetic = false;
+  mini_llama::BackendConfig backend_config;
   int argi = 2;
   if (argi < argc && argv[argi][0] != '-') {
     model_path = argv[argi++];
@@ -1048,6 +1343,17 @@ int RunChat(int argc, char** argv) {
       explicit_tokenizer_path = argv[++i];
     } else if (arg == "--synthetic") {
       use_synthetic = true;
+    } else if (arg == "--backend") {
+      if (i + 1 >= argc || !ParseBackendArg(argv[++i], backend_config)) {
+        std::cerr << "Invalid --backend value. Supported values: cpu, cuda.\n";
+        return 1;
+      }
+    } else if (arg == "--device") {
+      if (i + 1 >= argc || !ParseDeviceArg(argv[++i], backend_config)) {
+        std::cerr
+            << "Invalid --device value. Expected a non-negative integer.\n";
+        return 1;
+      }
     } else if (arg == "-h" || arg == "--help") {
       PrintUsage(argv[0]);
       return 0;
@@ -1055,6 +1361,10 @@ int RunChat(int argc, char** argv) {
       std::cerr << "unknown option: " << arg << "\n";
       return 1;
     }
+  }
+
+  if (!ValidateBackendOrPrint(backend_config)) {
+    return 1;
   }
 
   std::error_code exists_error;
@@ -1175,9 +1485,20 @@ int RunChat(int argc, char** argv) {
     session.AddMessage("system", "You are a helpful assistant.");
   }
 
+  if (!PrepareCudaWeightsOrPrint(model, backend_config)) {
+    return 1;
+  }
+
   term.PrintMessage("mini-llama chat");
-  term.PrintMessage("backend: cpu");
-  term.PrintMessage("compute: cpu");
+  term.PrintMessage("backend: " +
+                    mini_llama::BackendKindName(backend_config.kind));
+  term.PrintMessage(mini_llama::BackendExecutionNote(backend_config));
+  if (backend_config.kind == mini_llama::BackendKind::kCuda) {
+    std::ostringstream cuda_summary;
+    cuda_summary << "uploaded weights: "
+                 << mini_llama::ModelCudaUploadedWeightCount(model);
+    term.PrintMessage(cuda_summary.str());
+  }
   term.PrintMessage("Type /help for commands, /exit to quit.\n");
   if (EndsWithGguf(resolved_path)) {
     term.PrintMessage("CPU Forward on GGUF weights (dequantized to F32).\n");
@@ -1412,6 +1733,10 @@ int main(int argc, char** argv) {
 
   if (command == "bench") {
     return RunBench(argc, argv);
+  }
+
+  if (command == "--cuda-info") {
+    return RunCudaInfo();
   }
 
   std::cerr << "unknown command: " << command << "\n";

@@ -13,6 +13,10 @@ MiniLlamaContext::MiniLlamaContext(const MiniLlamaModel* model_ptr)
     const ModelConfig& config = model->config;
     kv_cache = KvCache(config.n_layers, config.max_seq_len, config.n_kv_heads,
                        config.head_dim);
+    if (model->cuda_weights) {
+      cuda_kv_cache.Reset(config.n_layers, config.max_seq_len, config.n_kv_heads,
+                          config.head_dim, model->cuda_weights->device_id);
+    }
   }
 }
 

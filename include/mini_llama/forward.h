@@ -17,6 +17,10 @@ int MapQHeadToKvHead(int q_head, int n_heads, int n_kv_heads);
 Tensor ForwardToken(MiniLlamaContext& ctx, const MiniLlamaModel& model,
                     int token);
 
+// Device-resident token forward. Used when model.cuda_weights is set.
+Tensor ForwardTokenDevice(MiniLlamaContext& ctx, const MiniLlamaModel& model,
+                          int token);
+
 // Sequential scheduler over MiniBatch. Prefill and Decode share this path.
 // Returns logits of the last token and appends tokens to ctx.token_history.
 Tensor ForwardBatch(MiniLlamaContext& ctx, const MiniLlamaModel& model,

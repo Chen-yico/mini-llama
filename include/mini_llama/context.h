@@ -5,6 +5,7 @@
 
 #include <vector>
 
+#include "mini_llama/cuda_kv_cache.h"
 #include "mini_llama/kv_cache.h"
 #include "mini_llama/model.h"
 
@@ -14,6 +15,7 @@ namespace mini_llama {
 struct MiniLlamaContext {
   const MiniLlamaModel* model = nullptr;
   KvCache kv_cache;
+  CudaKvCache cuda_kv_cache;
   int pos = 0;
   std::vector<int> token_history;
   int n_prefill_tokens = 0;
